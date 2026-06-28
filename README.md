@@ -1,5 +1,5 @@
 <h1 align="center">
-  <br>electron-libmpv<br>
+  electron-libmpv<br>
 </h1>
 
 <h4 align="center">
