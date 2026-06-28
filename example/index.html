@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>electron-libmpv example</title>
+	<style>
+		html, body {
+			margin: 0; padding: 0; width: 100%; height: 100%;
+			background-color: #111; overflow: hidden; font-family: sans-serif;
+		}
+		.container {
+			display: flex; flex-direction: column; width: 100%; height: 100vh;
+			background-color: #111; 
+		}
+		#video-placeholder {
+			flex: 1; 
+			width: 100%; 
+			background: #000; 
+		}
+		.controls {
+			display: flex; height: 70px; background: #141414;
+			align-items: center; padding: 0 15px;
+		}
+		button {
+			background: #2b2b2b; color: #fff; border: none;
+			padding: 8px 16px; margin-right: 10px; cursor: pointer;
+			border-radius: 4px; font-weight: bold;
+		}
+		button:hover { background: #3b3b3b; }
+	</style>
+</head>
+<body>
+	<div class="container">
+		<div id="video-placeholder"></div>
+		
+		<div class="seekbar-container" style="display: flex; background: #141414; padding: 5px 15px; align-items: center;">
+			<span id="time-current" style="color: #fff; font-size: 12px; font-family: monospace;">00:00</span>
+			<input type="range" id="seek-bar" min="0" max="100" value="0" step="0.1" style="flex: 1; margin: 0 10px; cursor: pointer;">
+			<span id="time-total" style="color: #fff; font-size: 12px; font-family: monospace;">00:00</span>
+		</div>
+		
+		<div class="controls">
+			<button id="toggle-play-btn">▶ Play Stream</button>
+		</div>
+	</div>
+	
+	<script src="renderer.js"></script>
+</body>
+</html>

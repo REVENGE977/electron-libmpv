@@ -1,0 +1,10 @@
+/node_modules/
+/npm-debug.log
+/build/
+*.node
+/prebuilds/
+/scripts/dist/
+libmpv-2.dll
+.vscode
+.DS_Store
+Thumbs.db
