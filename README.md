@@ -7,7 +7,7 @@
 </h4>
 
 A package based on [mpv.js](https://github.com/Kagami/mpv.js/) for modern Electron apps. Replaces legacy Pepper plugin architecture used in mpv.js with a native C++ window-embedding architecture that hooks directly into the host OS window handle for zero-copy hardware acceleration.
-This means your video renders completely inline within your layout, allowing for full HTML/CSS overlays and dynamic window resizing.
+This means your video renders completely inline within your layout.
 
 Check the example in the example folder. **For the example to work, you'll need libmpv-2.dll in the project's root folder.**
 
