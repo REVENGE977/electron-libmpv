@@ -4,10 +4,10 @@
       "target_name": "electron-libmpv",
       "sources": ["index.cc"],
       "include_dirs": [
-        "node_modules/node-addon-api"
+        "<!@(node -p \"require('node-addon-api').include\")"
       ],
       "dependencies": [
-        "node_modules/node-addon-api/node_addon_api.gyp:node_addon_api"
+        "<!(node -p \"require('node-addon-api').gyp\")"
       ],
       "cflags!": [ "-fno-exceptions" ],
       "cflags_cc!": [ "-fno-exceptions" ],
