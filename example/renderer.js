@@ -88,7 +88,7 @@ togglePlayBtn.addEventListener("click", () => {
 		ipcRenderer.sendSync("mpv-attach", rect.left, rect.top, rect.width, rect.height);
 		isAttached = true;
 		
-		ipcRenderer.send("mpv-command", "loadfile", "http://127.0.0.1:11470/0859a4efa3bf1a93edd68db449f0bb372af51a2b/0?");
+		ipcRenderer.send("mpv-command", "loadfile", path.join(__dirname, "tos.mkv"));
 		ipcRenderer.send("mpv-set-property", "pause", "no");
 		
 		togglePlayBtn.innerText = "❚❚ Pause";
