@@ -13,9 +13,15 @@ Check the example in the example folder. **For the example to work, you'll need 
 
 **Note: This library only works on Windows, for now.**
 
-## How to build?
-
+## Requirements
 * Install Visual Studio Build Tools with "Desktop development with C++"
+
+## How to install?
+```sh
+npm install github:REVENGE977/electron-libmpv
+```
+
+## How to build?
 
 ### Get libmpv
 
