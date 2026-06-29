@@ -50,6 +50,19 @@ function createWindow() {
 	ipcMain.on("mpv-get-property", (event, name) => {
 		event.returnValue = player.getRawProperty(name);
 	});
+
+	ipcMain.handle("show-open-dialog", async (event) => {
+		const { dialog } = require("electron");
+		const result = await dialog.showOpenDialog(mainWindow, {
+			properties: ["openFile"],
+			filters: [
+				{ name: "Video Files", extensions: ["mp4", "mkv", "avi", "mov", "webm"] },
+				{ name: "All Files", extensions: ["*"] }
+			]
+		});
+		
+		return result; 
+	});
 	
 	mainWindow.loadFile(path.join(__dirname, "index.html"));
 }

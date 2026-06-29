@@ -1,7 +1,16 @@
-/.npmignore
-/.eslintrc
-/.travis.yml
-/build/
-/example/
-/iojs-1.0.0/
-/scripts/
+# Ignore local compilation folders
+build/
+node_modules/
+*.node
+
+# Ignore the dynamic library (the user must supply their own libmpv-2.dll)
+libmpv-2.dll
+
+# Ignore heavy testing media inside your example folder
+example/tos.mkv
+
+# Ignore IDE configurations and system clutter
+.vscode/
+.gitignore
+.DS_Store
+Thumbs.db

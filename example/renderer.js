@@ -8,6 +8,7 @@ const seekBar = document.getElementById("seek-bar");
 const timeCurrent = document.getElementById("time-current");
 const timeTotal = document.getElementById("time-total");
 const togglePlayBtn = document.getElementById("toggle-play-btn");
+const openFileBtn = document.getElementById("open-file-btn");
 
 let isUserDragging = false; 
 let isFileLoaded = false;
@@ -103,4 +104,23 @@ togglePlayBtn.addEventListener("click", () => {
 		ipcRenderer.send("mpv-set-property", "pause", "yes");
 		togglePlayBtn.innerText = "▶ Play";
 	}
+});
+
+openFileBtn.addEventListener("click", async () => {
+    const result = await ipcRenderer.invoke("show-open-dialog");
+    
+    if (result && !result.canceled && result.filePaths.length > 0) {
+        const selectedFile = result.filePaths[0];
+        console.log(`Selected file: ${selectedFile}`);
+        
+        const rect = placeholder.getBoundingClientRect();
+
+        ipcRenderer.send("mpv-attach", rect.left, rect.top, rect.width, rect.height);
+        isAttached = true;
+        
+        ipcRenderer.send("mpv-command", "loadfile", selectedFile);
+        ipcRenderer.send("mpv-set-property", "pause", "no");
+        togglePlayBtn.innerText = "❚❚ Pause";
+        isFileLoaded = true;
+    }
 });

@@ -15,6 +15,8 @@ Check the example in the example folder. **For the example to work, you'll need 
 
 ## How to build?
 
+* Install Visual Studio Build Tools with "Desktop development with C++"
+
 ### Get libmpv
 
 To build and run the package, you need the [libmpv](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/) development files and the compiled runtime binary.
@@ -26,6 +28,9 @@ These files and folders need to exist in your C: drive inside a folder named mpv
 
 ![libmpv](/images/mpv-dev.jpeg)
 
+* **Development/Example:** Place `libmpv-2.dll` in the root of your project directory next to your main `index.js`.
+* **Production:** Ensure `libmpv-2.dll` is bundled into your final Electron build directory next to the main executable or within the app's working directory so Windows can locate it at runtime.
+  
 ### Build using node-gyp
 ```sh
 npm run build

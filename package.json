@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "description": "A library to embed mpv in Electron applications using libmpv.",
   "main": "index.js",
+  "gypfile": true,
   "scripts": {
+    "install": "node-gyp rebuild",
     "build": "node-gyp rebuild",
     "clean": "node-gyp clean",
     "example": "electron example",
