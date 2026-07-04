@@ -24,6 +24,7 @@ declare module 'electron-libmpv' {
 		command(...args: string[]): number;
 		property(name: string, value: string | number | boolean): number;
 		getRawProperty(name: string): string | null;
+		lockOverlayToParent(mainHandle: Buffer, overlayHandle: Buffer): boolean;
 	}
 	
 	export = Mpv;

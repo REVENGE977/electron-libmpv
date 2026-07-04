@@ -22,8 +22,9 @@ class Mpv {
 	}
 	
 	command(...args) { return this.player ? this.player.command(...args) : -1; }
-	property(name, value) { return this.player ? this.player.setProperty(name, value.toString()) : -1; -1; }
+	property(name, value) { return this.player ? this.player.setProperty(name, value.toString()) : -1; }
 	getRawProperty(name) { return this.player ? this.player.getProperty(name) : null; }
+	lockOverlayToParent(mainHandle, overlayHandle) { return this.player ? this.player.lockOverlayToParent(mainHandle, overlayHandle) : false; }
 }
 
 module.exports = Mpv;

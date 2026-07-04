@@ -12,16 +12,17 @@
 
 class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
 	public:
-		static Napi::Object Init(Napi::Env env, Napi::Object exports);
-		explicit MpvPlayer(const Napi::CallbackInfo& info);
-		virtual ~MpvPlayer();
+	static Napi::Object Init(Napi::Env env, Napi::Object exports);
+	explicit MpvPlayer(const Napi::CallbackInfo& info);
+	virtual ~MpvPlayer();
 	
 	private:
-		Napi::Value Command(const Napi::CallbackInfo& info);
-		Napi::Value SetProperty(const Napi::CallbackInfo& info);
-		Napi::Value GetProperty(const Napi::CallbackInfo& info);
-		Napi::Value Attach(const Napi::CallbackInfo& info);
-		Napi::Value Resize(const Napi::CallbackInfo& info);
+	Napi::Value Command(const Napi::CallbackInfo& info);
+	Napi::Value SetProperty(const Napi::CallbackInfo& info);
+	Napi::Value GetProperty(const Napi::CallbackInfo& info);
+	Napi::Value Attach(const Napi::CallbackInfo& info);
+	Napi::Value Resize(const Napi::CallbackInfo& info);
+	Napi::Value LockOverlayToParent(const Napi::CallbackInfo& info);
 	
 	static void OnMpvEvents(void* ctx);
 	
@@ -40,7 +41,8 @@ Napi::Object MpvPlayer::Init(Napi::Env env, Napi::Object exports) {
 		InstanceMethod("setProperty", &MpvPlayer::SetProperty),
 		InstanceMethod("getProperty", &MpvPlayer::GetProperty),
 		InstanceMethod("attach", &MpvPlayer::Attach),
-		InstanceMethod("resize", &MpvPlayer::Resize)
+		InstanceMethod("resize", &MpvPlayer::Resize),
+		InstanceMethod("lockOverlayToParent", &MpvPlayer::LockOverlayToParent)
 	});
 	
 	Napi::FunctionReference* constructor = new Napi::FunctionReference();
@@ -150,6 +152,25 @@ Napi::Value MpvPlayer::Resize(const Napi::CallbackInfo& info) {
 	return env.Null();
 }
 
+Napi::Value MpvPlayer::LockOverlayToParent(const Napi::CallbackInfo& info) {
+	Napi::Env env = info.Env();
+	#ifdef _WIN32
+	if (info.Length() < 2 || !info[0].IsBuffer() || !info[1].IsBuffer()) {
+		return Napi::Boolean::New(env, false);
+	}
+	
+	HWND main_hwnd = *reinterpret_cast<HWND*>(info[0].As<Napi::Buffer<uint8_t>>().Data());
+	HWND overlay_hwnd = *reinterpret_cast<HWND*>(info[1].As<Napi::Buffer<uint8_t>>().Data());
+	
+	SetWindowLongPtr(overlay_hwnd, GWLP_HWNDPARENT, (LONG_PTR)main_hwnd);
+	SetWindowPos(overlay_hwnd, main_hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+	
+	return Napi::Boolean::New(env, true);
+	#else
+	return Napi::Boolean::New(env, false);
+	#endif
+}
+
 Napi::Value MpvPlayer::GetProperty(const Napi::CallbackInfo& info) {
 	Napi::Env env = info.Env();
 	if (!mpv_ || info.Length() < 1) return env.Null();
@@ -183,4 +204,4 @@ Napi::Value MpvPlayer::SetProperty(const Napi::CallbackInfo& info) {
 }
 
 Napi::Object InitModule(Napi::Env env, Napi::Object exports) { return MpvPlayer::Init(env, exports); }
-NODE_API_MODULE(electron-libmpv, InitModule)
+NODE_API_MODULE(electron_libmpv, InitModule)

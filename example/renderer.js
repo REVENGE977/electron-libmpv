@@ -53,17 +53,17 @@ function updateTimelineMetrics() {
 		timeTotal.innerText = formatTime(duration);
 		seekBar.value = (current / duration) * 100;
 	}
-
+	
 	if (isFileLoaded) {
 		const hwdecActive = ipcRenderer.sendSync("mpv-get-property", "hwdec-current");
 		const containerFps = ipcRenderer.sendSync("mpv-get-property", "container-fps");
 		const estimatedFps = ipcRenderer.sendSync("mpv-get-property", "estimated-vf-fps");
-
+		
 		console.log(`--- MPV Diagnostics ---`);
 		console.log(`Hardware Decoding : ${hwdecActive === "no" ? "Software Mode" : `Active (${hwdecActive})`}`);
 		console.log(`Container Target  : ${containerFps ? parseFloat(containerFps).toFixed(2) : "Unknown"} FPS`);
 		console.log(`Real-time Display : ${estimatedFps ? parseFloat(estimatedFps).toFixed(2) : "Unknown"} FPS`);
-  	}
+	}
 }
 
 setInterval(() => {
@@ -107,20 +107,20 @@ togglePlayBtn.addEventListener("click", () => {
 });
 
 openFileBtn.addEventListener("click", async () => {
-    const result = await ipcRenderer.invoke("show-open-dialog");
-    
-    if (result && !result.canceled && result.filePaths.length > 0) {
-        const selectedFile = result.filePaths[0];
-        console.log(`Selected file: ${selectedFile}`);
-        
-        const rect = placeholder.getBoundingClientRect();
-
-        ipcRenderer.send("mpv-attach", rect.left, rect.top, rect.width, rect.height);
-        isAttached = true;
-        
-        ipcRenderer.send("mpv-command", "loadfile", selectedFile);
-        ipcRenderer.send("mpv-set-property", "pause", "no");
-        togglePlayBtn.innerText = "❚❚ Pause";
-        isFileLoaded = true;
-    }
+	const result = await ipcRenderer.invoke("show-open-dialog");
+	
+	if (result && !result.canceled && result.filePaths.length > 0) {
+		const selectedFile = result.filePaths[0];
+		console.log(`Selected file: ${selectedFile}`);
+		
+		const rect = placeholder.getBoundingClientRect();
+		
+		ipcRenderer.send("mpv-attach", rect.left, rect.top, rect.width, rect.height);
+		isAttached = true;
+		
+		ipcRenderer.send("mpv-command", "loadfile", selectedFile);
+		ipcRenderer.send("mpv-set-property", "pause", "no");
+		togglePlayBtn.innerText = "❚❚ Pause";
+		isFileLoaded = true;
+	}
 });
