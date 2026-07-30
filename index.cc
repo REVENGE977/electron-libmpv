@@ -10,6 +10,10 @@
 #include <windows.h>
 #endif
 
+#if defined(__linux__)
+#include <stdint.h>
+#endif
+
 class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
 	public:
 	static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -94,9 +98,9 @@ void MpvPlayer::OnMpvEvents(void* ctx) {
 
 Napi::Value MpvPlayer::Attach(const Napi::CallbackInfo& info) {
 	Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsBuffer()) return Napi::Boolean::New(env, false);
+
 	#ifdef _WIN32
-	if (info.Length() < 1 || !info[0].IsBuffer()) return Napi::Boolean::New(env, false);
-	
 	Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
 	parent_hwnd_ = *reinterpret_cast<HWND*>(buf.Data());
 	
@@ -132,6 +136,24 @@ Napi::Value MpvPlayer::Attach(const Napi::CallbackInfo& info) {
 	mpv_set_option_string(mpv_, "keep-open", "yes");
 	
 	return Napi::Boolean::New(env, true);
+
+	#elif defined(__linux__)
+	Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
+	unsigned long xid = *reinterpret_cast<unsigned long*>(buf.Data());
+    
+    int64_t wid = static_cast<int64_t>(xid);
+    mpv_set_option(mpv_, "wid", MPV_FORMAT_INT64, &wid);
+
+	if (mpv_initialize(mpv_) < 0) {
+		return Napi::Boolean::New(env, false);
+	}
+	
+	mpv_set_option_string(mpv_, "vo", "gpu-next"); 
+	mpv_set_option_string(mpv_, "hwdec", "auto"); 
+	mpv_set_option_string(mpv_, "osc", "no");
+	mpv_set_option_string(mpv_, "keep-open", "yes");
+
+    return Napi::Boolean::New(env, true);
 	#else
 	return Napi::Boolean::New(env, false);
 	#endif
@@ -148,7 +170,8 @@ Napi::Value MpvPlayer::Resize(const Napi::CallbackInfo& info) {
 		
 		SetWindowPos(sub_hwnd_, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
 	}
-	#endif
+	#elif defined(__linux__)
+    #endif
 	return env.Null();
 }
 
@@ -166,6 +189,8 @@ Napi::Value MpvPlayer::LockOverlayToParent(const Napi::CallbackInfo& info) {
 	SetWindowPos(overlay_hwnd, main_hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 	
 	return Napi::Boolean::New(env, true);
+    #elif defined(__linux__)
+    return Napi::Boolean::New(env, true);
 	#else
 	return Napi::Boolean::New(env, false);
 	#endif
