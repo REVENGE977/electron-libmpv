@@ -48,7 +48,11 @@ public:
     bool init(const MpvApi& api, mpv_handle* mpv, mpv_render_context** out_ctx, std::string& out_error) override {
         if (!loadLibs(out_error)) return false;
 
-        // Open DRM render node for headless GBM + zero-copy VAAPI hwdec.
+        // Open DRM render node for headless GBM + separate DRM file description for zero-copy VAAPI.
+        // CRITICAL: libva/iHD MUST use its own independent open() of /dev/dri/renderD* (separate
+        // kernel struct drm_file and GEM handle table) — sharing gbm_device's fd causes Mesa's
+        // GEM_CLOSE on imported EGLImages to destroy iHD's active VAAPI decode surfaces
+        // ("Failed to end picture decode issue: 23" / "vaExportSurfaceHandle() failed").
         for (int idx = 128; idx <= 135; ++idx) {
             std::string path = "/dev/dri/renderD" + std::to_string(idx);
             int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
@@ -57,6 +61,7 @@ public:
                 if (dev) {
                     drm_fd_ = fd;
                     gbm_dev_ = dev;
+                    vaapi_drm_fd_ = open(path.c_str(), O_RDWR | O_CLOEXEC);
                     break;
                 }
                 close(fd);
@@ -174,19 +179,50 @@ public:
             return false;
         }
 
+        // Check GL vendor so we only force vaapi EGL interop on VAAPI-capable drivers (Intel/AMD/Mesa),
+        // which also prevents mpv's drmprime-overlay probe from logging EBADF on headless render_fd.
+        bool is_nvidia = false;
+        if (glGetString_) {
+            const char* vendor = reinterpret_cast<const char*>(glGetString_(GL_VENDOR));
+            if (vendor && (std::strstr(vendor, "NVIDIA") != nullptr || std::strstr(vendor, "nvidia") != nullptr)) {
+                is_nvidia = true;
+            }
+        }
+        if (!is_nvidia && api.set_property_string) {
+            api.set_property_string(mpv, "gpu-hwdec-interop", "vaapi");
+        }
+
         mpv_opengl_init_params gl_init = {
             &LinuxDmaBufBackend::getProcAddress,
             this
         };
+        mpv_opengl_drm_params_v2 drm_params = {
+            -1,             // fd (not KMS)
+            0,              // crtc_id
+            0,              // connector_id
+            nullptr,        // atomic_request_ptr
+            vaapi_drm_fd_   // independent render_fd (own kernel drm_file) for zero-copy VAAPI interop
+        };
         char api_type[] = MPV_RENDER_API_TYPE_OPENGL;
 
-        mpv_render_param params[] = {
-            { MPV_RENDER_PARAM_API_TYPE, api_type },
-            { MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl_init },
-            { MPV_RENDER_PARAM_INVALID, nullptr },
-        };
-
-        int err = api.render_context_create(out_ctx, mpv, params);
+        int err = -1;
+        if (vaapi_drm_fd_ >= 0) {
+            mpv_render_param params[] = {
+                { MPV_RENDER_PARAM_API_TYPE, api_type },
+                { MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl_init },
+                { MPV_RENDER_PARAM_DRM_DISPLAY_V2, &drm_params },
+                { MPV_RENDER_PARAM_INVALID, nullptr },
+            };
+            err = api.render_context_create(out_ctx, mpv, params);
+        }
+        if (err < 0) {
+            mpv_render_param fallback_params[] = {
+                { MPV_RENDER_PARAM_API_TYPE, api_type },
+                { MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl_init },
+                { MPV_RENDER_PARAM_INVALID, nullptr },
+            };
+            err = api.render_context_create(out_ctx, mpv, fallback_params);
+        }
         if (err < 0) {
             out_error = std::string("mpv_render_context_create (Linux EGL) failed: ") + api.error_string(err);
             cleanupContext();
@@ -267,8 +303,13 @@ public:
             return false;
         }
 
-        // Ensure GPU writes to the DMA-BUF are visible before Chromium's GPU process imports it.
-        glFinish_();
+        // Flush GL commands to the kernel DRM driver so the DMA-BUF's kernel dma_resv write
+        // fence is queued before Electron's GPU process imports it — avoids CPU glFinish() stalls.
+        if (glFlush_) {
+            glFlush_();
+        } else {
+            glFinish_();
+        }
         api.render_context_report_swap(ctx);
 
         out_frame.type = FrameHandleType::LinuxNativePixmap;
@@ -389,6 +430,7 @@ private:
         gbm_bo_get_stride_ = reinterpret_cast<decltype(gbm_bo_get_stride_)>(dlsym(gbm_lib_, "gbm_bo_get_stride"));
         gbm_bo_get_offset_ = reinterpret_cast<decltype(gbm_bo_get_offset_)>(dlsym(gbm_lib_, "gbm_bo_get_offset"));
         gbm_bo_get_modifier_ = reinterpret_cast<decltype(gbm_bo_get_modifier_)>(dlsym(gbm_lib_, "gbm_bo_get_modifier"));
+        gbm_bo_get_plane_count_ = reinterpret_cast<decltype(gbm_bo_get_plane_count_)>(dlsym(gbm_lib_, "gbm_bo_get_plane_count"));
 
         eglGetDisplay_ = reinterpret_cast<decltype(eglGetDisplay_)>(dlsym(egl_lib_, "eglGetDisplay"));
         eglGetPlatformDisplay_ = reinterpret_cast<decltype(eglGetPlatformDisplay_)>(dlsym(egl_lib_, "eglGetPlatformDisplay"));
@@ -431,6 +473,8 @@ private:
         glBindFramebuffer_ = reinterpret_cast<decltype(glBindFramebuffer_)>(getProcAddress(this, "glBindFramebuffer"));
         glFramebufferTexture2D_ = reinterpret_cast<decltype(glFramebufferTexture2D_)>(getProcAddress(this, "glFramebufferTexture2D"));
         glCheckFramebufferStatus_ = reinterpret_cast<decltype(glCheckFramebufferStatus_)>(getProcAddress(this, "glCheckFramebufferStatus"));
+        glGetString_ = reinterpret_cast<decltype(glGetString_)>(getProcAddress(this, "glGetString"));
+        glFlush_ = reinterpret_cast<decltype(glFlush_)>(getProcAddress(this, "glFlush"));
         glFinish_ = reinterpret_cast<decltype(glFinish_)>(getProcAddress(this, "glFinish"));
         glEGLImageTargetTexture2DOES_ = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
             getProcAddress(this, "glEGLImageTargetTexture2DOES")
@@ -472,8 +516,22 @@ private:
         for (const auto& cand : candidates) {
             gbm_bo* bo = nullptr;
 
-            // Linear modifier has the highest cross-vendor DMA-BUF compatibility with Chromium.
-            if (gbm_bo_create_with_modifiers_) {
+            // Prefer GPU-native single-plane tiled layout (e.g. I915_FORMAT_MOD_Y_TILED) for much
+            // higher 4K FBO memory bandwidth when EGL DMA-BUF modifiers are supported.
+            // Reject multi-plane modifiers (e.g. CCS compression) since we export plane 0 only.
+            if (has_dmabuf_modifiers_) {
+                gbm_bo* tiled = gbm_bo_create_(gbm_dev_, w, h, cand.gbm_fmt, GBM_BO_USE_RENDERING);
+                if (tiled) {
+                    int planes = gbm_bo_get_plane_count_ ? gbm_bo_get_plane_count_(tiled) : 1;
+                    uint64_t mod = gbm_bo_get_modifier_ ? gbm_bo_get_modifier_(tiled) : DRM_FORMAT_MOD_INVALID;
+                    if (planes == 1 && mod != DRM_FORMAT_MOD_INVALID) {
+                        bo = tiled;
+                    } else {
+                        gbm_bo_destroy_(tiled);
+                    }
+                }
+            }
+            if (!bo && gbm_bo_create_with_modifiers_) {
                 uint64_t linear_mod = DRM_FORMAT_MOD_LINEAR;
                 bo = gbm_bo_create_with_modifiers_(gbm_dev_, w, h, cand.gbm_fmt, &linear_mod, 1);
             }
@@ -608,6 +666,10 @@ private:
             gbm_device_destroy_(gbm_dev_);
             gbm_dev_ = nullptr;
         }
+        if (vaapi_drm_fd_ >= 0) {
+            close(vaapi_drm_fd_);
+            vaapi_drm_fd_ = -1;
+        }
         if (drm_fd_ >= 0) {
             close(drm_fd_);
             drm_fd_ = -1;
@@ -619,6 +681,7 @@ private:
     }
 
     int drm_fd_ = -1;
+    int vaapi_drm_fd_ = -1;
     gbm_device* gbm_dev_ = nullptr;
     EGLDisplay egl_display_ = EGL_NO_DISPLAY;
     EGLContext egl_context_ = EGL_NO_CONTEXT;
@@ -645,6 +708,7 @@ private:
     uint32_t (*gbm_bo_get_stride_)(gbm_bo*) = nullptr;
     uint32_t (*gbm_bo_get_offset_)(gbm_bo*, int) = nullptr;
     uint64_t (*gbm_bo_get_modifier_)(gbm_bo*) = nullptr;
+    int (*gbm_bo_get_plane_count_)(gbm_bo*) = nullptr;
 
     EGLDisplay (*eglGetDisplay_)(EGLNativeDisplayType) = nullptr;
     EGLDisplay (*eglGetPlatformDisplay_)(EGLenum, void*, const EGLAttrib*) = nullptr;
@@ -670,6 +734,8 @@ private:
     void (*glBindFramebuffer_)(GLenum, GLuint) = nullptr;
     void (*glFramebufferTexture2D_)(GLenum, GLenum, GLenum, GLuint, GLint) = nullptr;
     GLenum (*glCheckFramebufferStatus_)(GLenum) = nullptr;
+    const GLubyte* (*glGetString_)(GLenum) = nullptr;
+    void (*glFlush_)(void) = nullptr;
     void (*glFinish_)(void) = nullptr;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES_ = nullptr;
 };

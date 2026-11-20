@@ -537,23 +537,34 @@ private:
                     return true;
                 }
 
+                // Fast GPU-friendly defaults for smooth 4K 10-bit HDR on integrated GPUs
+                // (loaded before mpv.conf so users can override quality/scalers if desired).
+                api_.set_option_string(mpv_, "video-timing-offset", "0");
+                api_.set_option_string(mpv_, "video-sync", "audio");
+                api_.set_option_string(mpv_, "hwdec", "vaapi,vaapi-copy,auto-copy");
+                api_.set_option_string(mpv_, "keep-open", "no");
+                api_.set_option_string(mpv_, "idle", "yes");
+                api_.set_option_string(mpv_, "tone-mapping", "bt.2390");
+                api_.set_option_string(mpv_, "hdr-compute-peak", "no");
+                api_.set_option_string(mpv_, "scale", "bilinear");
+                api_.set_option_string(mpv_, "cscale", "bilinear");
+                api_.set_option_string(mpv_, "dscale", "bilinear");
+                api_.set_option_string(mpv_, "correct-downscaling", "no");
+                api_.set_option_string(mpv_, "linear-downscaling", "no");
+                api_.set_option_string(mpv_, "dither-depth", "no");
+                api_.set_option_string(mpv_, "gpu-shader-cache", "yes");
+                api_.set_option_string(mpv_, "demuxer-max-bytes", "150MiB");
+                api_.set_option_string(mpv_, "demuxer-max-back-bytes", "75MiB");
+
                 if (!config_path.empty()) {
                     api_.set_option_string(mpv_, "include", config_path.c_str());
                 }
 
+                // Always lock embedded rendering options after user config.
                 api_.set_option_string(mpv_, "vo", "libmpv");
-                api_.set_option_string(mpv_, "video-timing-offset", "0");
-                api_.set_option_string(mpv_, "video-sync", "audio");
-                api_.set_option_string(mpv_, "hwdec", "auto-copy");
                 api_.set_option_string(mpv_, "osc", "no");
                 api_.set_option_string(mpv_, "input-default-bindings", "no");
                 api_.set_option_string(mpv_, "input-vo-keyboard", "no");
-                api_.set_option_string(mpv_, "keep-open", "no");
-                api_.set_option_string(mpv_, "idle", "yes");
-                api_.set_option_string(mpv_, "tone-mapping", "bt.2390");
-                api_.set_option_string(mpv_, "hdr-compute-peak", "yes");
-                api_.set_option_string(mpv_, "demuxer-max-bytes", "150MiB");
-                api_.set_option_string(mpv_, "demuxer-max-back-bytes", "75MiB");
 
                 int err = api_.initialize(mpv_);
                 if (err < 0) {
@@ -564,7 +575,7 @@ private:
                     return true;
                 }
 
-                api_.request_log_messages(mpv_, "info");
+                api_.request_log_messages(mpv_, "warn");
 
                 render_init_done_ = false;
                 render_init_ok_ = false;

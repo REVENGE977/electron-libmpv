@@ -686,28 +686,36 @@ Napi::Value MpvPlayer::Initialize(const Napi::CallbackInfo& info) {
         return result;
     }
 
-    if (!mpv_config_path_.empty()) {
-        api_.set_option_string(mpv_, "include", mpv_config_path_.c_str());
-    }
-
-    // Core embedded rendering options (matching stremio-linux-shell baseline + 4K HDR tuning).
-    api_.set_option_string(mpv_, "vo", "libmpv");
+    // Fast GPU-friendly defaults for smooth 4K 10-bit HDR (overridable via mpv.conf).
     api_.set_option_string(mpv_, "video-timing-offset", "0");
     api_.set_option_string(mpv_, "video-sync", "audio");
     api_.set_option_string(mpv_, "hwdec", "auto-safe");
 #ifdef _WIN32
     api_.set_option_string(mpv_, "d3d11va-zero-copy", "yes");
 #endif
-    api_.set_option_string(mpv_, "vd-lavc-dr", "yes");
-    api_.set_option_string(mpv_, "osc", "no");
-    api_.set_option_string(mpv_, "input-default-bindings", "no");
-    api_.set_option_string(mpv_, "input-vo-keyboard", "no");
     api_.set_option_string(mpv_, "keep-open", "no");
     api_.set_option_string(mpv_, "idle", "yes");
     api_.set_option_string(mpv_, "tone-mapping", "bt.2390");
-    api_.set_option_string(mpv_, "hdr-compute-peak", "yes");
+    api_.set_option_string(mpv_, "hdr-compute-peak", "no");
+    api_.set_option_string(mpv_, "scale", "bilinear");
+    api_.set_option_string(mpv_, "cscale", "bilinear");
+    api_.set_option_string(mpv_, "dscale", "bilinear");
+    api_.set_option_string(mpv_, "correct-downscaling", "no");
+    api_.set_option_string(mpv_, "linear-downscaling", "no");
+    api_.set_option_string(mpv_, "dither-depth", "no");
+    api_.set_option_string(mpv_, "gpu-shader-cache", "yes");
     api_.set_option_string(mpv_, "demuxer-max-bytes", "150MiB");
     api_.set_option_string(mpv_, "demuxer-max-back-bytes", "75MiB");
+
+    if (!mpv_config_path_.empty()) {
+        api_.set_option_string(mpv_, "include", mpv_config_path_.c_str());
+    }
+
+    // Always lock embedded rendering options after user config.
+    api_.set_option_string(mpv_, "vo", "libmpv");
+    api_.set_option_string(mpv_, "osc", "no");
+    api_.set_option_string(mpv_, "input-default-bindings", "no");
+    api_.set_option_string(mpv_, "input-vo-keyboard", "no");
 
     int err = api_.initialize(mpv_);
     if (err < 0) {
@@ -719,7 +727,7 @@ Napi::Value MpvPlayer::Initialize(const Napi::CallbackInfo& info) {
         return result;
     }
 
-    api_.request_log_messages(mpv_, "info");
+    api_.request_log_messages(mpv_, "warn");
     api_.set_wakeup_callback(mpv_, &MpvPlayer::OnMpvWakeup, this);
 
     render_init_done_ = false;
