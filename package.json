@@ -1,6 +1,6 @@
 {
   "name": "electron-libmpv",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A library to embed mpv in Electron applications using libmpv.",
   "main": "index.js",
   "types": "index.d.ts",
