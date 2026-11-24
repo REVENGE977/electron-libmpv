@@ -768,9 +768,6 @@ Napi::Value MpvPlayer::Initialize(const Napi::CallbackInfo& info) {
         "stream-lavf-o",
         "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=%23%408,429,500,502,503,504,reconnect_delay_max=15"
     );
-    api_.set_option_string(mpv_, "osc", "no");
-    api_.set_option_string(mpv_, "input-default-bindings", "no");
-    api_.set_option_string(mpv_, "input-vo-keyboard", "no");
     api_.set_option_string(mpv_, "keep-open", "no");
     api_.set_option_string(mpv_, "idle", "yes");
     api_.set_option_string(mpv_, "tone-mapping", "bt.2390");
@@ -779,6 +776,7 @@ Napi::Value MpvPlayer::Initialize(const Napi::CallbackInfo& info) {
     api_.set_option_string(mpv_, "deband", "yes");
     api_.set_option_string(mpv_, "scale", "spline36");
     api_.set_option_string(mpv_, "cscale", "spline36");
+    api_.set_option_string(mpv_, "gpu-shader-cache", "yes");
     api_.set_option_string(mpv_, "demuxer-max-bytes", "150MiB");
     api_.set_option_string(mpv_, "demuxer-max-back-bytes", "75MiB");
 
@@ -786,8 +784,11 @@ Napi::Value MpvPlayer::Initialize(const Napi::CallbackInfo& info) {
         api_.set_option_string(mpv_, "include", mpv_config_path_.c_str());
     }
 
-    // Always force vo=libmpv after user config so embedded rendering cannot be broken by mpv.conf.
+    // Always lock embedded rendering options after user config so mpv.conf cannot break embedded playback.
     api_.set_option_string(mpv_, "vo", "libmpv");
+    api_.set_option_string(mpv_, "osc", "no");
+    api_.set_option_string(mpv_, "input-default-bindings", "no");
+    api_.set_option_string(mpv_, "input-vo-keyboard", "no");
 
     int err = api_.initialize(mpv_);
     if (err < 0) {
@@ -799,7 +800,7 @@ Napi::Value MpvPlayer::Initialize(const Napi::CallbackInfo& info) {
         return result;
     }
 
-    api_.request_log_messages(mpv_, "info");
+    api_.request_log_messages(mpv_, "warn");
     api_.set_wakeup_callback(mpv_, &MpvPlayer::OnMpvWakeup, this);
 
     render_init_done_ = false;

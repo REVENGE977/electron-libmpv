@@ -567,6 +567,7 @@ private:
                     return true;
                 }
 
+                // Core embedded rendering & streaming resilience defaults (loaded before mpv.conf so users can override).
                 api_.set_option_string(mpv_, "title", "Stremio Enhanced");
                 api_.set_option_string(mpv_, "audio-client-name", "Stremio Enhanced");
                 api_.set_option_string(mpv_, "video-timing-offset", "0");
@@ -577,9 +578,6 @@ private:
                     "stream-lavf-o",
                     "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=%23%408,429,500,502,503,504,reconnect_delay_max=15"
                 );
-                api_.set_option_string(mpv_, "osc", "no");
-                api_.set_option_string(mpv_, "input-default-bindings", "no");
-                api_.set_option_string(mpv_, "input-vo-keyboard", "no");
                 api_.set_option_string(mpv_, "keep-open", "no");
                 api_.set_option_string(mpv_, "idle", "yes");
                 api_.set_option_string(mpv_, "tone-mapping", "bt.2390");
@@ -588,6 +586,7 @@ private:
                 api_.set_option_string(mpv_, "deband", "yes");
                 api_.set_option_string(mpv_, "scale", "spline36");
                 api_.set_option_string(mpv_, "cscale", "spline36");
+                api_.set_option_string(mpv_, "gpu-shader-cache", "yes");
                 api_.set_option_string(mpv_, "demuxer-max-bytes", "150MiB");
                 api_.set_option_string(mpv_, "demuxer-max-back-bytes", "75MiB");
 
@@ -595,7 +594,11 @@ private:
                     api_.set_option_string(mpv_, "include", config_path.c_str());
                 }
 
+                // Always lock embedded rendering options after user config.
                 api_.set_option_string(mpv_, "vo", "libmpv");
+                api_.set_option_string(mpv_, "osc", "no");
+                api_.set_option_string(mpv_, "input-default-bindings", "no");
+                api_.set_option_string(mpv_, "input-vo-keyboard", "no");
 
                 int err = api_.initialize(mpv_);
                 if (err < 0) {
@@ -606,7 +609,7 @@ private:
                     return true;
                 }
 
-                api_.request_log_messages(mpv_, "info");
+                api_.request_log_messages(mpv_, "warn");
 
                 render_init_done_ = false;
                 render_init_ok_ = false;
