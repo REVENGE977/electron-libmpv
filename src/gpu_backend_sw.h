@@ -29,15 +29,20 @@ public:
         return true;
     }
 
-    bool ensureSurface(int width, int height, bool /*hdr*/, std::string& /*out_error*/) override {
+    bool ensureSurface(int width, int height, bool /*hdr*/, bool& out_recreated, std::string& /*out_error*/) override {
         width = width < 16 ? 16 : width;
         height = height < 16 ? 16 : height;
-        if (width == width_ && height == height_) return true;
+        if (width == width_ && height == height_) {
+            out_recreated = false;
+            return true;
+        }
 
         width_ = width;
         height_ = height;
         // 64-byte aligned stride for SIMD efficiency (see mpv/render.h).
         stride_ = ((static_cast<size_t>(width_) * 4 + 63) / 64) * 64;
+        resetSlots();
+        out_recreated = true;
         return true;
     }
 

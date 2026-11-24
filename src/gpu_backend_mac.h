@@ -94,13 +94,18 @@ public:
         return true;
     }
 
-    bool ensureSurface(int width, int height, bool hdr, std::string& out_error) override {
+    bool ensureSurface(int width, int height, bool hdr, bool& out_recreated, std::string& out_error) override {
         width = width < 16 ? 16 : width;
         height = height < 16 ? 16 : height;
         bool use_hdr = hdr && hdr_supported_;
 
         if (width == width_ && height == height_ && use_hdr == hdr_active_ && surfaces_ready_) {
+            out_recreated = false;
             return true;
+        }
+
+        if (cgl_ctx_ && CGLGetCurrentContext() != cgl_ctx_) {
+            CGLSetCurrentContext(cgl_ctx_);
         }
 
         destroySurfaces();
@@ -116,14 +121,16 @@ public:
                     destroySurfaces();
                     hdr_supported_ = false;
                     hdr_active_ = false;
-                    return ensureSurface(width, height, false, out_error);
+                    return ensureSurface(width, height, false, out_recreated, out_error);
                 }
                 destroySurfaces();
+                out_recreated = false;
                 return false;
             }
         }
 
         surfaces_ready_ = true;
+        out_recreated = true;
         return true;
     }
 
@@ -137,6 +144,10 @@ public:
         if (!surfaces_ready_ || slot < 0 || slot >= kSurfacePoolSize) {
             out_error = "macOS IOSurface slots not ready";
             return false;
+        }
+
+        if (cgl_ctx_ && CGLGetCurrentContext() != cgl_ctx_) {
+            CGLSetCurrentContext(cgl_ctx_);
         }
 
         const SurfaceSlot& s = slots_[slot];
@@ -165,6 +176,10 @@ public:
         glFinish();
         api.render_context_report_swap(ctx);
 
+        // Retain IOSurface per dispatched frame so a concurrent resize/destroySurfaces()
+        // can never free the IOSurfaceRef before Electron's main thread calls importSharedTexture().
+        CFRetain(s.surface);
+
         out_frame.type = FrameHandleType::MacIOSurface;
         out_frame.slot_id = slot;
         out_frame.width = width_;
@@ -172,6 +187,7 @@ public:
         out_frame.pixel_format = hdr_active_ ? "rgbaf16" : "bgra";
         out_frame.hdr = hdr_active_;
         out_frame.io_surface = reinterpret_cast<uintptr_t>(s.surface);
+        out_frame.owns_io_surface = true;
 
         auto now = std::chrono::steady_clock::now().time_since_epoch();
         out_frame.timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
@@ -254,10 +270,12 @@ private:
         glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
+        // Apple CGLTexImageIOSurface2D expects unsized GL_RGBA for both 32BGRA and 64RGBAHalf
+        // (matching Chromium/ANGLE IOSurfaceSurfaceCGL); fall back to sized tokens if needed.
         CGLError err = CGLTexImageIOSurface2D(
             cgl_ctx_,
             GL_TEXTURE_RECTANGLE,
-            hdr ? GL_RGBA16F : GL_RGBA8,
+            GL_RGBA,
             w,
             h,
             hdr ? GL_RGBA : GL_BGRA,
@@ -265,6 +283,19 @@ private:
             slot.surface,
             0
         );
+        if (err != kCGLNoError) {
+            err = CGLTexImageIOSurface2D(
+                cgl_ctx_,
+                GL_TEXTURE_RECTANGLE,
+                hdr ? GL_RGBA16F : GL_RGBA8,
+                w,
+                h,
+                hdr ? GL_RGBA : GL_BGRA,
+                hdr ? GL_HALF_FLOAT : GL_UNSIGNED_INT_8_8_8_8_REV,
+                slot.surface,
+                0
+            );
+        }
         glBindTexture(GL_TEXTURE_RECTANGLE, 0);
 
         if (err != kCGLNoError) {

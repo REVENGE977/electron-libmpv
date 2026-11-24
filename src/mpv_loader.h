@@ -79,9 +79,68 @@ struct MpvApi {
         return true;
     }
 
+#ifdef _WIN32
+    static std::wstring utf8ToWide(const std::string& s) {
+        if (s.empty()) return std::wstring();
+        int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+        if (len <= 0) return std::wstring();
+        std::wstring out(static_cast<size_t>(len), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &out[0], len);
+        return out;
+    }
+
+    static std::string wideToUtf8(const std::wstring& w) {
+        if (w.empty()) return std::string();
+        int len = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+        if (len <= 0) return std::string();
+        std::string out(static_cast<size_t>(len), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), &out[0], len, nullptr, nullptr);
+        return out;
+    }
+
+    static std::wstring getExeDirWide() {
+        std::wstring buf(32768, L'\0');
+        DWORD len = GetModuleFileNameW(nullptr, &buf[0], static_cast<DWORD>(buf.size()));
+        if (len == 0 || len >= buf.size()) return std::wstring();
+        buf.resize(len);
+        size_t slash = buf.find_last_of(L"\\/");
+        return slash != std::wstring::npos ? buf.substr(0, slash + 1) : std::wstring();
+    }
+#endif
+
     bool load(const std::string& custom_path = "") {
         if (loaded) return true;
 
+#ifdef _WIN32
+        std::vector<std::wstring> candidates;
+        if (!custom_path.empty()) {
+            candidates.push_back(utf8ToWide(custom_path));
+        }
+
+        const wchar_t* env_path = _wgetenv(L"ELECTRON_LIBMPV_PATH");
+        if (env_path && env_path[0] != L'\0') {
+            candidates.push_back(env_path);
+        }
+
+        std::wstring exe_dir = getExeDirWide();
+        if (!exe_dir.empty()) {
+            candidates.push_back(exe_dir + L"libmpv-2.dll");
+            candidates.push_back(exe_dir + L"mpv-2.dll");
+            candidates.push_back(exe_dir + L"resources\\libmpv-2.dll");
+        }
+        candidates.push_back(L"libmpv-2.dll");
+        candidates.push_back(L"mpv-2.dll");
+        candidates.push_back(L"mpv-1.dll");
+
+        for (const auto& candidate : candidates) {
+            if (candidate.empty()) continue;
+            lib_handle = LoadLibraryW(candidate.c_str());
+            if (lib_handle) {
+                loaded_path = wideToUtf8(candidate);
+                break;
+            }
+        }
+#else
         std::vector<std::string> candidates;
         if (!custom_path.empty()) {
             candidates.push_back(custom_path);
@@ -92,26 +151,13 @@ struct MpvApi {
             candidates.push_back(env_path);
         }
 
-#ifdef _WIN32
-        char exe_buf[MAX_PATH] = {0};
-        if (GetModuleFileNameA(nullptr, exe_buf, MAX_PATH) > 0) {
-            std::string exe_dir(exe_buf);
-            size_t slash = exe_dir.find_last_of("\\/");
-            if (slash != std::string::npos) {
-                exe_dir = exe_dir.substr(0, slash + 1);
-                candidates.push_back(exe_dir + "libmpv-2.dll");
-                candidates.push_back(exe_dir + "mpv-2.dll");
-                candidates.push_back(exe_dir + "resources\\libmpv-2.dll");
-            }
-        }
-        candidates.push_back("libmpv-2.dll");
-        candidates.push_back("mpv-2.dll");
-        candidates.push_back("mpv-1.dll");
-#elif defined(__APPLE__)
+#ifdef __APPLE__
         candidates.push_back("@rpath/libmpv.2.dylib");
         candidates.push_back("@loader_path/libmpv.2.dylib");
         candidates.push_back("@executable_path/../Frameworks/libmpv.2.dylib");
+        candidates.push_back("@executable_path/../Frameworks/libmpv.dylib");
         candidates.push_back("@executable_path/../Resources/libmpv.2.dylib");
+        candidates.push_back("@executable_path/../Resources/libmpv.dylib");
         candidates.push_back("/opt/homebrew/lib/libmpv.2.dylib");
         candidates.push_back("/opt/homebrew/lib/libmpv.dylib");
         candidates.push_back("/usr/local/lib/libmpv.2.dylib");
@@ -129,27 +175,27 @@ struct MpvApi {
         candidates.push_back("/usr/local/lib/libmpv.so.2");
 #endif
 
+        std::string first_dl_err;
         for (const auto& candidate : candidates) {
-#ifdef _WIN32
-            lib_handle = LoadLibraryA(candidate.c_str());
-#else
             lib_handle = dlopen(candidate.c_str(), RTLD_NOW | RTLD_LOCAL);
-#endif
             if (lib_handle) {
                 loaded_path = candidate;
                 break;
             }
+            const char* err = dlerror();
+            if (err && first_dl_err.empty()) {
+                first_dl_err = err;
+            }
         }
+#endif
 
         if (!lib_handle) {
 #ifdef _WIN32
             last_error = "Unable to load libmpv-2.dll. Ensure libmpv-2.dll is bundled or on PATH.";
 #elif defined(__APPLE__)
-            const char* err = dlerror();
-            last_error = std::string("Unable to load libmpv.2.dylib (install via `brew install mpv` or bundle libmpv): ") + (err ? err : "unknown error");
+            last_error = std::string("Unable to load libmpv.2.dylib (install via `brew install mpv` or bundle libmpv; under Hardened Runtime ensure disable-library-validation or signed dylib): ") + (first_dl_err.empty() ? "unknown error" : first_dl_err);
 #else
-            const char* err = dlerror();
-            last_error = std::string("Unable to load libmpv.so.2 (install mpv / libmpv2): ") + (err ? err : "unknown error");
+            last_error = std::string("Unable to load libmpv.so.2 (install mpv / libmpv2): ") + (first_dl_err.empty() ? "unknown error" : first_dl_err);
 #endif
             return false;
         }

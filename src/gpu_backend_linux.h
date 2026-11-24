@@ -4,40 +4,98 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <string>
 #include <unistd.h>
 
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-#include <GLES2/gl2.h>
-#include <GLES2/gl2ext.h>
-#include <gbm.h>
-
 #include "gpu_backend.h"
 
-#ifndef DRM_FORMAT_MOD_INVALID
-#define DRM_FORMAT_MOD_INVALID ((1ULL << 56) - 1)
-#endif
-#ifndef DRM_FORMAT_MOD_LINEAR
-#define DRM_FORMAT_MOD_LINEAR 0ULL
-#endif
-#ifndef GBM_FORMAT_ABGR16161616F
-#define GBM_FORMAT_ABGR16161616F 0x48344241U /* fourcc('A','B','4','H') */
-#endif
-#ifndef GL_RGBA8
-#define GL_RGBA8 0x8058
-#endif
-#ifndef GL_RGBA16F
-#define GL_RGBA16F 0x881A
-#endif
-#ifndef EGL_PLATFORM_GBM_KHR
-#define EGL_PLATFORM_GBM_KHR 0x31D7
-#endif
-
 namespace electron_mpv {
+
+// Minimal self-contained EGL / GLES2 / GBM definitions so Linux builds have zero
+// compile-time dependency on libgbm-dev, libegl-dev, or libgles2-mesa-dev.
+typedef void* EGLDisplay;
+typedef void* EGLConfig;
+typedef void* EGLContext;
+typedef void* EGLSurface;
+typedef void* EGLImageKHR;
+typedef void* EGLClientBuffer;
+typedef void* EGLNativeDisplayType;
+typedef unsigned int EGLBoolean;
+typedef unsigned int EGLenum;
+typedef int32_t EGLint;
+typedef intptr_t EGLAttrib;
+typedef void (*__eglMustCastToProperFunctionPointerType)(void);
+
+typedef unsigned int GLenum;
+typedef unsigned int GLuint;
+typedef int GLint;
+typedef int GLsizei;
+
+struct gbm_device;
+struct gbm_bo;
+
+constexpr EGLDisplay kLinuxEglNoDisplay = nullptr;
+constexpr EGLContext kLinuxEglNoContext = nullptr;
+constexpr EGLSurface kLinuxEglNoSurface = nullptr;
+constexpr EGLImageKHR kLinuxEglNoImage = nullptr;
+constexpr EGLConfig kLinuxEglNoConfig = nullptr;
+
+constexpr EGLint kLinuxEglNone = 0x3038;
+constexpr EGLint kLinuxEglRedSize = 0x3024;
+constexpr EGLint kLinuxEglGreenSize = 0x3023;
+constexpr EGLint kLinuxEglBlueSize = 0x3022;
+constexpr EGLint kLinuxEglAlphaSize = 0x3021;
+constexpr EGLint kLinuxEglRenderableType = 0x3040;
+constexpr EGLint kLinuxEglOpenglBit = 0x0008;
+constexpr EGLint kLinuxEglOpenglEs3Bit = 0x0040;
+constexpr EGLint kLinuxEglExtensions = 0x3055;
+constexpr EGLint kLinuxEglWidth = 0x3057;
+constexpr EGLint kLinuxEglHeight = 0x3056;
+constexpr EGLint kLinuxEglContextClientVersion = 0x3098;
+constexpr EGLint kLinuxEglContextMajorVersion = 0x3098;
+constexpr EGLint kLinuxEglContextMinorVersion = 0x30FB;
+constexpr EGLint kLinuxEglContextOpenglProfileMask = 0x30FD;
+constexpr EGLint kLinuxEglContextOpenglCoreProfileBit = 0x00000001;
+constexpr EGLenum kLinuxEglOpenglApi = 0x30A2;
+constexpr EGLenum kLinuxEglOpenglEsApi = 0x30A0;
+constexpr EGLenum kLinuxEglPlatformGbmKhr = 0x31D7;
+constexpr EGLenum kLinuxEglLinuxDmaBufExt = 0x3270;
+constexpr EGLint kLinuxEglLinuxDrmFourccExt = 0x3271;
+constexpr EGLint kLinuxEglDmaBufPlane0FdExt = 0x3272;
+constexpr EGLint kLinuxEglDmaBufPlane0OffsetExt = 0x3273;
+constexpr EGLint kLinuxEglDmaBufPlane0PitchExt = 0x3274;
+constexpr EGLint kLinuxEglDmaBufPlane0ModifierLoExt = 0x3443;
+constexpr EGLint kLinuxEglDmaBufPlane0ModifierHiExt = 0x3444;
+
+constexpr GLenum kLinuxGlTexture2d = 0x0DE1;
+constexpr GLenum kLinuxGlTextureMinFilter = 0x2801;
+constexpr GLenum kLinuxGlTextureMagFilter = 0x2800;
+constexpr GLenum kLinuxGlTextureWrapS = 0x2802;
+constexpr GLenum kLinuxGlTextureWrapT = 0x2803;
+constexpr GLint kLinuxGlLinear = 0x2601;
+constexpr GLint kLinuxGlClampToEdge = 0x812F;
+constexpr GLenum kLinuxGlFramebuffer = 0x8D40;
+constexpr GLenum kLinuxGlColorAttachment0 = 0x8CE0;
+constexpr GLenum kLinuxGlFramebufferComplete = 0x8CD5;
+constexpr GLint kLinuxGlRgba8 = 0x8058;
+constexpr GLint kLinuxGlRgba16f = 0x881A;
+
+constexpr uint64_t kDrmFormatModInvalid = ((1ULL << 56) - 1);
+constexpr uint64_t kDrmFormatModLinear = 0ULL;
+constexpr uint32_t kGbmFormatArgb8888 = 0x34325241U;        // fourcc('A','R','2','4')
+constexpr uint32_t kGbmFormatAbgr8888 = 0x34324241U;        // fourcc('A','B','2','4')
+constexpr uint32_t kGbmFormatAbgr16161616f = 0x48344241U;   // fourcc('A','B','4','H')
+constexpr uint32_t kGbmBoUseRendering = (1U << 2);
+constexpr uint32_t kGbmBoUseLinear = (1U << 4);
+
+typedef EGLDisplay (*PfnEglGetPlatformDisplayExt)(EGLenum, void*, const EGLint*);
+typedef EGLImageKHR (*PfnEglCreateImageKhr)(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint*);
+typedef EGLBoolean (*PfnEglDestroyImageKhr)(EGLDisplay, EGLImageKHR);
+typedef void (*PfnGlEglImageTargetTexture2dOes)(GLenum, EGLImageKHR);
 
 class LinuxDmaBufBackend final : public RenderBackend {
 public:
@@ -49,8 +107,17 @@ public:
         if (!loadLibs(out_error)) return false;
 
         // Open DRM render node for headless GBM + zero-copy VAAPI hwdec.
+        // Honor optional ELECTRON_LIBMPV_DRM_DEVICE override for multi-GPU systems.
+        std::vector<std::string> drm_candidates;
+        const char* env_drm = std::getenv("ELECTRON_LIBMPV_DRM_DEVICE");
+        if (env_drm && env_drm[0] != '\0') {
+            drm_candidates.push_back(env_drm);
+        }
         for (int idx = 128; idx <= 135; ++idx) {
-            std::string path = "/dev/dri/renderD" + std::to_string(idx);
+            drm_candidates.push_back("/dev/dri/renderD" + std::to_string(idx));
+        }
+
+        for (const auto& path : drm_candidates) {
             int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
             if (fd >= 0) {
                 gbm_device* dev = gbm_create_device_(fd);
@@ -71,16 +138,16 @@ public:
 
         // Create GBM EGL display.
         if (eglGetPlatformDisplay_) {
-            egl_display_ = eglGetPlatformDisplay_(EGL_PLATFORM_GBM_KHR, gbm_dev_, nullptr);
+            egl_display_ = eglGetPlatformDisplay_(kLinuxEglPlatformGbmKhr, gbm_dev_, nullptr);
         }
-        if (egl_display_ == EGL_NO_DISPLAY && eglGetPlatformDisplayEXT_) {
-            egl_display_ = eglGetPlatformDisplayEXT_(EGL_PLATFORM_GBM_KHR, gbm_dev_, nullptr);
+        if (egl_display_ == kLinuxEglNoDisplay && eglGetPlatformDisplayEXT_) {
+            egl_display_ = eglGetPlatformDisplayEXT_(kLinuxEglPlatformGbmKhr, gbm_dev_, nullptr);
         }
-        if (egl_display_ == EGL_NO_DISPLAY) {
+        if (egl_display_ == kLinuxEglNoDisplay) {
             egl_display_ = eglGetDisplay_(reinterpret_cast<EGLNativeDisplayType>(gbm_dev_));
         }
 
-        if (egl_display_ == EGL_NO_DISPLAY) {
+        if (egl_display_ == kLinuxEglNoDisplay) {
             out_error = "Failed to get GBM EGLDisplay";
             cleanupContext();
             return false;
@@ -93,7 +160,7 @@ public:
             return false;
         }
 
-        const char* exts = eglQueryString_(egl_display_, EGL_EXTENSIONS);
+        const char* exts = eglQueryString_(egl_display_, kLinuxEglExtensions);
         std::string ext_str = exts ? exts : "";
         has_dmabuf_modifiers_ = ext_str.find("EGL_EXT_image_dma_buf_import_modifiers") != std::string::npos;
         const bool has_no_config = ext_str.find("EGL_KHR_no_config_context") != std::string::npos;
@@ -110,29 +177,29 @@ public:
             if (!eglBindAPI_(api_enum)) return false;
 
             if (has_no_config) {
-                egl_context_ = eglCreateContext_(egl_display_, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, ctx_attribs);
-                if (egl_context_ == EGL_NO_CONTEXT && fallback_ctx_attribs) {
-                    egl_context_ = eglCreateContext_(egl_display_, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, fallback_ctx_attribs);
+                egl_context_ = eglCreateContext_(egl_display_, kLinuxEglNoConfig, kLinuxEglNoContext, ctx_attribs);
+                if (egl_context_ == kLinuxEglNoContext && fallback_ctx_attribs) {
+                    egl_context_ = eglCreateContext_(egl_display_, kLinuxEglNoConfig, kLinuxEglNoContext, fallback_ctx_attribs);
                 }
-                if (egl_context_ != EGL_NO_CONTEXT) return true;
+                if (egl_context_ != kLinuxEglNoContext) return true;
             }
 
             const EGLint cfg_attribs[] = {
-                EGL_RENDERABLE_TYPE, renderable_bit,
-                EGL_RED_SIZE, 8,
-                EGL_GREEN_SIZE, 8,
-                EGL_BLUE_SIZE, 8,
-                EGL_ALPHA_SIZE, 8,
-                EGL_NONE
+                kLinuxEglRenderableType, renderable_bit,
+                kLinuxEglRedSize, 8,
+                kLinuxEglGreenSize, 8,
+                kLinuxEglBlueSize, 8,
+                kLinuxEglAlphaSize, 8,
+                kLinuxEglNone
             };
             EGLConfig cfg = nullptr;
             EGLint num_cfg = 0;
             if (eglChooseConfig_(egl_display_, cfg_attribs, &cfg, 1, &num_cfg) && num_cfg > 0) {
-                egl_context_ = eglCreateContext_(egl_display_, cfg, EGL_NO_CONTEXT, ctx_attribs);
-                if (egl_context_ == EGL_NO_CONTEXT && fallback_ctx_attribs) {
-                    egl_context_ = eglCreateContext_(egl_display_, cfg, EGL_NO_CONTEXT, fallback_ctx_attribs);
+                egl_context_ = eglCreateContext_(egl_display_, cfg, kLinuxEglNoContext, ctx_attribs);
+                if (egl_context_ == kLinuxEglNoContext && fallback_ctx_attribs) {
+                    egl_context_ = eglCreateContext_(egl_display_, cfg, kLinuxEglNoContext, fallback_ctx_attribs);
                 }
-                if (egl_context_ != EGL_NO_CONTEXT) return true;
+                if (egl_context_ != kLinuxEglNoContext) return true;
             }
             return false;
         };
@@ -140,13 +207,13 @@ public:
         bool ctx_ok = false;
         if (gl_lib_) {
             static const EGLint gl_ctx_attribs[] = {
-                EGL_CONTEXT_MAJOR_VERSION, 3,
-                EGL_CONTEXT_MINOR_VERSION, 2,
-                EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-                EGL_NONE
+                kLinuxEglContextMajorVersion, 3,
+                kLinuxEglContextMinorVersion, 2,
+                kLinuxEglContextOpenglProfileMask, kLinuxEglContextOpenglCoreProfileBit,
+                kLinuxEglNone
             };
-            static const EGLint gl_fallback_attribs[] = { EGL_NONE };
-            if (tryCreateContext(EGL_OPENGL_API, EGL_OPENGL_BIT, gl_ctx_attribs, gl_fallback_attribs)) {
+            static const EGLint gl_fallback_attribs[] = { kLinuxEglNone };
+            if (tryCreateContext(kLinuxEglOpenglApi, kLinuxEglOpenglBit, gl_ctx_attribs, gl_fallback_attribs)) {
                 using_gles_ = false;
                 ctx_ok = true;
             }
@@ -154,16 +221,16 @@ public:
 
         if (!ctx_ok && gles_lib_) {
             static const EGLint gles_ctx_attribs[] = {
-                EGL_CONTEXT_CLIENT_VERSION, 3,
-                EGL_NONE
+                kLinuxEglContextClientVersion, 3,
+                kLinuxEglNone
             };
-            if (tryCreateContext(EGL_OPENGL_ES_API, EGL_OPENGL_ES3_BIT, gles_ctx_attribs, nullptr)) {
+            if (tryCreateContext(kLinuxEglOpenglEsApi, kLinuxEglOpenglEs3Bit, gles_ctx_attribs, nullptr)) {
                 using_gles_ = true;
                 ctx_ok = true;
             }
         }
 
-        if (!ctx_ok || !eglMakeCurrent_(egl_display_, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context_)) {
+        if (!ctx_ok || !eglMakeCurrent_(egl_display_, kLinuxEglNoSurface, kLinuxEglNoSurface, egl_context_)) {
             out_error = "Failed to create or bind surfaceless EGL context";
             cleanupContext();
             return false;
@@ -178,15 +245,32 @@ public:
             &LinuxDmaBufBackend::getProcAddress,
             this
         };
+        mpv_opengl_drm_params_v2 drm_params = {
+            -1,
+            0,
+            0,
+            nullptr,
+            drm_fd_
+        };
         char api_type[] = MPV_RENDER_API_TYPE_OPENGL;
 
         mpv_render_param params[] = {
             { MPV_RENDER_PARAM_API_TYPE, api_type },
             { MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl_init },
+            { MPV_RENDER_PARAM_DRM_DISPLAY_V2, &drm_params },
             { MPV_RENDER_PARAM_INVALID, nullptr },
         };
 
         int err = api.render_context_create(out_ctx, mpv, params);
+        if (err < 0) {
+            // Fallback without DRM_DISPLAY_V2 in case an older libmpv rejects it.
+            mpv_render_param fallback_params[] = {
+                { MPV_RENDER_PARAM_API_TYPE, api_type },
+                { MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl_init },
+                { MPV_RENDER_PARAM_INVALID, nullptr },
+            };
+            err = api.render_context_create(out_ctx, mpv, fallback_params);
+        }
         if (err < 0) {
             out_error = std::string("mpv_render_context_create (Linux EGL) failed: ") + api.error_string(err);
             cleanupContext();
@@ -198,12 +282,13 @@ public:
         return true;
     }
 
-    bool ensureSurface(int width, int height, bool hdr, std::string& out_error) override {
+    bool ensureSurface(int width, int height, bool hdr, bool& out_recreated, std::string& out_error) override {
         width = width < 16 ? 16 : width;
         height = height < 16 ? 16 : height;
         bool use_hdr = hdr && hdr_supported_;
 
         if (width == width_ && height == height_ && use_hdr == hdr_active_ && surfaces_ready_) {
+            out_recreated = false;
             return true;
         }
 
@@ -221,14 +306,16 @@ public:
                     destroySurfaces();
                     hdr_supported_ = false;
                     hdr_active_ = false;
-                    return ensureSurface(width, height, false, out_error);
+                    return ensureSurface(width, height, false, out_recreated, out_error);
                 }
                 destroySurfaces();
+                out_recreated = false;
                 return false;
             }
         }
 
         surfaces_ready_ = true;
+        out_recreated = true;
         return true;
     }
 
@@ -294,7 +381,7 @@ public:
         uint32_t stride = 0;
         uint64_t offset = 0;
         uint64_t size = 0;
-        uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+        uint64_t modifier = kDrmFormatModInvalid;
         std::string pixel_format = "bgra";
     };
 
@@ -315,8 +402,8 @@ public:
     bool currentHdr() const { return hdr_active_; }
 
     void shutdown(const MpvApi& api, mpv_render_context* ctx) override {
-        if (egl_display_ != EGL_NO_DISPLAY && egl_context_ != EGL_NO_CONTEXT) {
-            eglMakeCurrent_(egl_display_, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context_);
+        if (egl_display_ != kLinuxEglNoDisplay && egl_context_ != kLinuxEglNoContext) {
+            eglMakeCurrent_(egl_display_, kLinuxEglNoSurface, kLinuxEglNoSurface, egl_context_);
         }
         if (ctx) {
             api.render_context_free(ctx);
@@ -332,11 +419,11 @@ private:
         uint32_t stride = 0;
         uint64_t offset = 0;
         uint64_t size = 0;
-        uint64_t modifier = DRM_FORMAT_MOD_INVALID;
-        EGLImageKHR egl_image = EGL_NO_IMAGE_KHR;
+        uint64_t modifier = kDrmFormatModInvalid;
+        EGLImageKHR egl_image = kLinuxEglNoImage;
         GLuint texture = 0;
         GLuint fbo = 0;
-        int gl_internal_format = GL_RGBA8;
+        int gl_internal_format = kLinuxGlRgba8;
         std::string pixel_format = "bgra";
     };
 
@@ -410,9 +497,9 @@ private:
             return false;
         }
 
-        eglGetPlatformDisplayEXT_ = reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(eglGetProcAddress_("eglGetPlatformDisplayEXT"));
-        eglCreateImageKHR_ = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress_("eglCreateImageKHR"));
-        eglDestroyImageKHR_ = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress_("eglDestroyImageKHR"));
+        eglGetPlatformDisplayEXT_ = reinterpret_cast<PfnEglGetPlatformDisplayExt>(eglGetProcAddress_("eglGetPlatformDisplayEXT"));
+        eglCreateImageKHR_ = reinterpret_cast<PfnEglCreateImageKhr>(eglGetProcAddress_("eglCreateImageKHR"));
+        eglDestroyImageKHR_ = reinterpret_cast<PfnEglDestroyImageKhr>(eglGetProcAddress_("eglDestroyImageKHR"));
 
         if (!eglCreateImageKHR_ || !eglDestroyImageKHR_) {
             out_error = "Missing eglCreateImageKHR/eglDestroyImageKHR";
@@ -432,7 +519,7 @@ private:
         glFramebufferTexture2D_ = reinterpret_cast<decltype(glFramebufferTexture2D_)>(getProcAddress(this, "glFramebufferTexture2D"));
         glCheckFramebufferStatus_ = reinterpret_cast<decltype(glCheckFramebufferStatus_)>(getProcAddress(this, "glCheckFramebufferStatus"));
         glFinish_ = reinterpret_cast<decltype(glFinish_)>(getProcAddress(this, "glFinish"));
-        glEGLImageTargetTexture2DOES_ = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+        glEGLImageTargetTexture2DOES_ = reinterpret_cast<PfnGlEglImageTargetTexture2dOes>(
             getProcAddress(this, "glEGLImageTargetTexture2DOES")
         );
 
@@ -463,10 +550,10 @@ private:
 
         std::vector<FormatCandidate> candidates;
         if (hdr) {
-            candidates.push_back({ GBM_FORMAT_ABGR16161616F, GL_RGBA16F, "rgbaf16" });
+            candidates.push_back({ kGbmFormatAbgr16161616f, kLinuxGlRgba16f, "rgbaf16" });
         } else {
-            candidates.push_back({ GBM_FORMAT_ARGB8888, GL_RGBA8, "bgra" });
-            candidates.push_back({ GBM_FORMAT_ABGR8888, GL_RGBA8, "rgba" });
+            candidates.push_back({ kGbmFormatArgb8888, kLinuxGlRgba8, "bgra" });
+            candidates.push_back({ kGbmFormatAbgr8888, kLinuxGlRgba8, "rgba" });
         }
 
         for (const auto& cand : candidates) {
@@ -474,14 +561,14 @@ private:
 
             // Linear modifier has the highest cross-vendor DMA-BUF compatibility with Chromium.
             if (gbm_bo_create_with_modifiers_) {
-                uint64_t linear_mod = DRM_FORMAT_MOD_LINEAR;
+                uint64_t linear_mod = kDrmFormatModLinear;
                 bo = gbm_bo_create_with_modifiers_(gbm_dev_, w, h, cand.gbm_fmt, &linear_mod, 1);
             }
             if (!bo) {
-                bo = gbm_bo_create_(gbm_dev_, w, h, cand.gbm_fmt, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+                bo = gbm_bo_create_(gbm_dev_, w, h, cand.gbm_fmt, kGbmBoUseRendering | kGbmBoUseLinear);
             }
             if (!bo) {
-                bo = gbm_bo_create_(gbm_dev_, w, h, cand.gbm_fmt, GBM_BO_USE_RENDERING);
+                bo = gbm_bo_create_(gbm_dev_, w, h, cand.gbm_fmt, kGbmBoUseRendering);
             }
             if (!bo) continue;
 
@@ -493,29 +580,29 @@ private:
 
             uint32_t stride = gbm_bo_get_stride_(bo);
             uint64_t offset = gbm_bo_get_offset_ ? static_cast<uint64_t>(gbm_bo_get_offset_(bo, 0)) : 0;
-            uint64_t modifier = gbm_bo_get_modifier_ ? gbm_bo_get_modifier_(bo) : DRM_FORMAT_MOD_INVALID;
+            uint64_t modifier = gbm_bo_get_modifier_ ? gbm_bo_get_modifier_(bo) : kDrmFormatModInvalid;
             uint64_t size = static_cast<uint64_t>(stride) * static_cast<uint64_t>(h);
 
             std::vector<EGLint> attribs = {
-                EGL_WIDTH, w,
-                EGL_HEIGHT, h,
-                EGL_LINUX_DRM_FOURCC_EXT, static_cast<EGLint>(cand.gbm_fmt),
-                EGL_DMA_BUF_PLANE0_FD_EXT, fd,
-                EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(offset),
-                EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLint>(stride),
+                kLinuxEglWidth, w,
+                kLinuxEglHeight, h,
+                kLinuxEglLinuxDrmFourccExt, static_cast<EGLint>(cand.gbm_fmt),
+                kLinuxEglDmaBufPlane0FdExt, fd,
+                kLinuxEglDmaBufPlane0OffsetExt, static_cast<EGLint>(offset),
+                kLinuxEglDmaBufPlane0PitchExt, static_cast<EGLint>(stride),
             };
-            if (has_dmabuf_modifiers_ && modifier != DRM_FORMAT_MOD_INVALID) {
-                attribs.push_back(EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT);
+            if (has_dmabuf_modifiers_ && modifier != kDrmFormatModInvalid) {
+                attribs.push_back(kLinuxEglDmaBufPlane0ModifierLoExt);
                 attribs.push_back(static_cast<EGLint>(modifier & 0xffffffffULL));
-                attribs.push_back(EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT);
+                attribs.push_back(kLinuxEglDmaBufPlane0ModifierHiExt);
                 attribs.push_back(static_cast<EGLint>((modifier >> 32) & 0xffffffffULL));
             }
-            attribs.push_back(EGL_NONE);
+            attribs.push_back(kLinuxEglNone);
 
             EGLImageKHR image = eglCreateImageKHR_(
-                egl_display_, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs.data()
+                egl_display_, kLinuxEglNoContext, kLinuxEglLinuxDmaBufExt, nullptr, attribs.data()
             );
-            if (image == EGL_NO_IMAGE_KHR) {
+            if (image == kLinuxEglNoImage) {
                 close(fd);
                 gbm_bo_destroy_(bo);
                 continue;
@@ -523,21 +610,21 @@ private:
 
             GLuint tex = 0, fbo = 0;
             glGenTextures_(1, &tex);
-            glBindTexture_(GL_TEXTURE_2D, tex);
-            glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glEGLImageTargetTexture2DOES_(GL_TEXTURE_2D, image);
-            glBindTexture_(GL_TEXTURE_2D, 0);
+            glBindTexture_(kLinuxGlTexture2d, tex);
+            glTexParameteri_(kLinuxGlTexture2d, kLinuxGlTextureMinFilter, kLinuxGlLinear);
+            glTexParameteri_(kLinuxGlTexture2d, kLinuxGlTextureMagFilter, kLinuxGlLinear);
+            glTexParameteri_(kLinuxGlTexture2d, kLinuxGlTextureWrapS, kLinuxGlClampToEdge);
+            glTexParameteri_(kLinuxGlTexture2d, kLinuxGlTextureWrapT, kLinuxGlClampToEdge);
+            glEGLImageTargetTexture2DOES_(kLinuxGlTexture2d, image);
+            glBindTexture_(kLinuxGlTexture2d, 0);
 
             glGenFramebuffers_(1, &fbo);
-            glBindFramebuffer_(GL_FRAMEBUFFER, fbo);
-            glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
-            GLenum status = glCheckFramebufferStatus_(GL_FRAMEBUFFER);
-            glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+            glBindFramebuffer_(kLinuxGlFramebuffer, fbo);
+            glFramebufferTexture2D_(kLinuxGlFramebuffer, kLinuxGlColorAttachment0, kLinuxGlTexture2d, tex, 0);
+            GLenum status = glCheckFramebufferStatus_(kLinuxGlFramebuffer);
+            glBindFramebuffer_(kLinuxGlFramebuffer, 0);
 
-            if (status != GL_FRAMEBUFFER_COMPLETE) {
+            if (status != kLinuxGlFramebufferComplete) {
                 glDeleteFramebuffers_(1, &fbo);
                 glDeleteTextures_(1, &tex);
                 eglDestroyImageKHR_(egl_display_, image);
@@ -573,9 +660,9 @@ private:
             glDeleteTextures_(1, &s.texture);
             s.texture = 0;
         }
-        if (s.egl_image != EGL_NO_IMAGE_KHR && eglDestroyImageKHR_ && egl_display_ != EGL_NO_DISPLAY) {
+        if (s.egl_image != kLinuxEglNoImage && eglDestroyImageKHR_ && egl_display_ != kLinuxEglNoDisplay) {
             eglDestroyImageKHR_(egl_display_, s.egl_image);
-            s.egl_image = EGL_NO_IMAGE_KHR;
+            s.egl_image = kLinuxEglNoImage;
         }
         if (s.dmabuf_fd >= 0) {
             close(s.dmabuf_fd);
@@ -595,14 +682,14 @@ private:
     }
 
     void cleanupContext() {
-        if (egl_display_ != EGL_NO_DISPLAY) {
-            if (eglMakeCurrent_) eglMakeCurrent_(egl_display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-            if (egl_context_ != EGL_NO_CONTEXT && eglDestroyContext_) {
+        if (egl_display_ != kLinuxEglNoDisplay) {
+            if (eglMakeCurrent_) eglMakeCurrent_(egl_display_, kLinuxEglNoSurface, kLinuxEglNoSurface, kLinuxEglNoContext);
+            if (egl_context_ != kLinuxEglNoContext && eglDestroyContext_) {
                 eglDestroyContext_(egl_display_, egl_context_);
-                egl_context_ = EGL_NO_CONTEXT;
+                egl_context_ = kLinuxEglNoContext;
             }
             if (eglTerminate_) eglTerminate_(egl_display_);
-            egl_display_ = EGL_NO_DISPLAY;
+            egl_display_ = kLinuxEglNoDisplay;
         }
         if (gbm_dev_ && gbm_device_destroy_) {
             gbm_device_destroy_(gbm_dev_);
@@ -620,8 +707,8 @@ private:
 
     int drm_fd_ = -1;
     gbm_device* gbm_dev_ = nullptr;
-    EGLDisplay egl_display_ = EGL_NO_DISPLAY;
-    EGLContext egl_context_ = EGL_NO_CONTEXT;
+    EGLDisplay egl_display_ = kLinuxEglNoDisplay;
+    EGLContext egl_context_ = kLinuxEglNoContext;
     bool using_gles_ = false;
     bool has_dmabuf_modifiers_ = false;
     bool hdr_supported_ = false;
@@ -648,7 +735,7 @@ private:
 
     EGLDisplay (*eglGetDisplay_)(EGLNativeDisplayType) = nullptr;
     EGLDisplay (*eglGetPlatformDisplay_)(EGLenum, void*, const EGLAttrib*) = nullptr;
-    PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT_ = nullptr;
+    PfnEglGetPlatformDisplayExt eglGetPlatformDisplayEXT_ = nullptr;
     EGLBoolean (*eglInitialize_)(EGLDisplay, EGLint*, EGLint*) = nullptr;
     EGLBoolean (*eglTerminate_)(EGLDisplay) = nullptr;
     EGLBoolean (*eglBindAPI_)(EGLenum) = nullptr;
@@ -658,8 +745,8 @@ private:
     EGLBoolean (*eglMakeCurrent_)(EGLDisplay, EGLSurface, EGLSurface, EGLContext) = nullptr;
     const char* (*eglQueryString_)(EGLDisplay, EGLint) = nullptr;
     __eglMustCastToProperFunctionPointerType (*eglGetProcAddress_)(const char*) = nullptr;
-    PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR_ = nullptr;
-    PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR_ = nullptr;
+    PfnEglCreateImageKhr eglCreateImageKHR_ = nullptr;
+    PfnEglDestroyImageKhr eglDestroyImageKHR_ = nullptr;
 
     void (*glGenTextures_)(GLsizei, GLuint*) = nullptr;
     void (*glDeleteTextures_)(GLsizei, const GLuint*) = nullptr;
@@ -671,7 +758,7 @@ private:
     void (*glFramebufferTexture2D_)(GLenum, GLenum, GLenum, GLuint, GLint) = nullptr;
     GLenum (*glCheckFramebufferStatus_)(GLenum) = nullptr;
     void (*glFinish_)(void) = nullptr;
-    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES_ = nullptr;
+    PfnGlEglImageTargetTexture2dOes glEGLImageTargetTexture2DOES_ = nullptr;
 };
 
 }  // namespace electron_mpv

@@ -31,7 +31,9 @@ struct FrameDescriptor {
 
     // Platform handles
     uintptr_t nt_handle = 0;
+    bool owns_nt_handle = false;
     uintptr_t io_surface = 0;
+    bool owns_io_surface = false;
 
     // Linux NativePixmap (single-plane RGBA/BGRA/RGBAF16 DMA-BUF)
     int dmabuf_fd = -1;
@@ -58,7 +60,8 @@ public:
     virtual bool init(const MpvApi& api, mpv_handle* mpv, mpv_render_context** out_ctx, std::string& out_error) = 0;
 
     // Called on the dedicated render thread when size or HDR mode changes.
-    virtual bool ensureSurface(int width, int height, bool hdr, std::string& out_error) = 0;
+    // Sets `out_recreated = true` only when the surface pool was actually recreated and slots were reset.
+    virtual bool ensureSurface(int width, int height, bool hdr, bool& out_recreated, std::string& out_error) = 0;
 
     // Called on the dedicated render thread to render the next frame into `slot`.
     virtual bool renderFrame(

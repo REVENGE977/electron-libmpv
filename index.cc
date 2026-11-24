@@ -17,6 +17,7 @@ NODE_API_MODULE(electron_libmpv, InitModule)
 #include <atomic>
 #include <chrono>
 #include <clocale>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -93,21 +94,40 @@ mpv_format ParseObserveFormat(const std::string& fmt) {
     return MPV_FORMAT_STRING;
 }
 
-std::unique_ptr<RenderBackend> CreateBestGpuBackend() {
+std::vector<std::unique_ptr<RenderBackend>> CreateGpuBackends() {
+    std::vector<std::unique_ptr<RenderBackend>> candidates;
 #ifdef _WIN32
-    return std::make_unique<WinAngleD3D11Backend>();
+    // Electron <= 43 bundles libEGL.dll / libGLESv2.dll; Electron 44+ statically links ANGLE,
+    // so fall back seamlessly to WGL + WGL_NV_DX_interop2 -> D3D11 shared NT handle.
+    candidates.push_back(std::make_unique<WinAngleD3D11Backend>());
+    candidates.push_back(std::make_unique<WinWglD3D11Backend>());
 #elif defined(__APPLE__)
-    return std::make_unique<MacIOSurfaceBackend>();
+    candidates.push_back(std::make_unique<MacIOSurfaceBackend>());
 #elif defined(__linux__)
-    return std::make_unique<LinuxDmaBufBackend>();
-#else
-    return std::make_unique<SoftwareRenderBackend>();
+    candidates.push_back(std::make_unique<LinuxDmaBufBackend>());
 #endif
+    return candidates;
 }
 
 struct DispatchedFrame {
     FrameDescriptor frame;
     uint64_t generation = 0;
+
+    ~DispatchedFrame() {
+#ifdef _WIN32
+        if (frame.owns_nt_handle && frame.nt_handle != 0) {
+            CloseHandle(reinterpret_cast<HANDLE>(frame.nt_handle));
+            frame.nt_handle = 0;
+            frame.owns_nt_handle = false;
+        }
+#elif defined(__APPLE__)
+        if (frame.owns_io_surface && frame.io_surface != 0) {
+            CFRelease(reinterpret_cast<IOSurfaceRef>(frame.io_surface));
+            frame.io_surface = 0;
+            frame.owns_io_surface = false;
+        }
+#endif
+    }
 };
 
 }  // namespace
@@ -142,12 +162,14 @@ private:
     mpv_handle* mpv_ = nullptr;
     mpv_render_context* render_ctx_ = nullptr;
     std::unique_ptr<RenderBackend> backend_;
+    std::mutex backend_mutex_;
 
     Napi::ThreadSafeFunction event_tsfn_;
     Napi::ThreadSafeFunction frame_tsfn_;
     bool has_event_tsfn_ = false;
     bool has_frame_tsfn_ = false;
 
+    std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
     std::atomic<bool> destroyed_{false};
     std::atomic<bool> initialized_{false};
     std::atomic<bool> event_wakeup_pending_{false};
@@ -245,6 +267,7 @@ void MpvPlayer::ShutdownInternal() {
     if (!destroyed_.compare_exchange_strong(expected, true)) {
         return;
     }
+    alive_->store(false, std::memory_order_release);
 
     if (render_thread_.joinable()) {
         {
@@ -280,7 +303,9 @@ void MpvPlayer::OnMpvWakeup(void* ctx) {
         return;
     }
 
-    self->event_tsfn_.NonBlockingCall([self](Napi::Env env, Napi::Function js_callback) {
+    auto alive = self->alive_;
+    self->event_tsfn_.NonBlockingCall([self, alive](Napi::Env env, Napi::Function js_callback) {
+        if (!alive->load(std::memory_order_acquire)) return;
         self->event_wakeup_pending_.store(false, std::memory_order_release);
         if (!self->destroyed_.load(std::memory_order_acquire)) {
             self->DrainMpvEvents(env, js_callback);
@@ -405,12 +430,22 @@ void MpvPlayer::RenderThreadMain(bool prefer_gpu) {
 
     std::string gpu_error;
     if (prefer_gpu) {
-        backend_ = CreateBestGpuBackend();
-        if (backend_->init(api_, mpv_, &render_ctx_, gpu_error)) {
-            init_ok = true;
-        } else {
+        auto candidates = CreateGpuBackends();
+        for (auto& candidate : candidates) {
+            std::string candidate_err;
+            if (candidate->init(api_, mpv_, &render_ctx_, candidate_err)) {
+                backend_ = std::move(candidate);
+                gpu_error.clear();
+                init_ok = true;
+                break;
+            }
+            if (!candidate_err.empty()) {
+                if (!gpu_error.empty()) gpu_error += " | ";
+                gpu_error += std::string(candidate->name()) + ": " + candidate_err;
+            }
+        }
+        if (!init_ok) {
             init_error = gpu_error;
-            backend_.reset();
         }
     }
 
@@ -427,18 +462,24 @@ void MpvPlayer::RenderThreadMain(bool prefer_gpu) {
 
     if (init_ok && backend_ && render_ctx_) {
         std::string surf_err;
-        if (!backend_->ensureSurface(target_width_, target_height_, target_hdr_, surf_err)) {
+        bool recreated = false;
+        if (!backend_->ensureSurface(target_width_, target_height_, target_hdr_, recreated, surf_err)) {
             if (backend_->supportsSharedTexture()) {
                 gpu_error = gpu_error.empty() ? surf_err : (gpu_error + " | " + surf_err);
                 backend_->shutdown(api_, render_ctx_);
                 render_ctx_ = nullptr;
-                backend_ = std::make_unique<SoftwareRenderBackend>();
+                {
+                    std::lock_guard<std::mutex> blk(backend_mutex_);
+                    backend_ = std::make_unique<SoftwareRenderBackend>();
+                }
                 std::string sw_err;
+                bool sw_recreated = false;
                 if (backend_->init(api_, mpv_, &render_ctx_, sw_err)) {
-                    backend_->ensureSurface(target_width_, target_height_, false, sw_err);
+                    backend_->ensureSurface(target_width_, target_height_, false, sw_recreated, sw_err);
                 } else {
                     init_ok = false;
                     init_error = surf_err + " | SW fallback: " + sw_err;
+                    std::lock_guard<std::mutex> blk(backend_mutex_);
                     backend_.reset();
                 }
             } else {
@@ -474,6 +515,7 @@ void MpvPlayer::RenderThreadMain(bool prefer_gpu) {
         bool do_frame = false;
         bool do_resize = false;
         bool do_fallback = false;
+        bool force_redraw = false;
         int req_w = 0;
         int req_h = 0;
         bool req_hdr = false;
@@ -486,6 +528,10 @@ void MpvPlayer::RenderThreadMain(bool prefer_gpu) {
 
             if (render_stop_) break;
 
+            req_w = target_width_;
+            req_h = target_height_;
+            req_hdr = target_hdr_;
+
             if (render_fallback_requested_) {
                 do_fallback = true;
                 render_fallback_requested_ = false;
@@ -493,9 +539,6 @@ void MpvPlayer::RenderThreadMain(bool prefer_gpu) {
             if (render_resize_pending_) {
                 do_resize = true;
                 render_resize_pending_ = false;
-                req_w = target_width_;
-                req_h = target_height_;
-                req_hdr = target_hdr_;
             }
             if (render_frame_pending_) {
                 do_frame = true;
@@ -505,13 +548,25 @@ void MpvPlayer::RenderThreadMain(bool prefer_gpu) {
 
         if (do_fallback && backend_->supportsSharedTexture()) {
             api_.render_context_set_update_callback(render_ctx_, nullptr, nullptr);
-            backend_->shutdown(api_, render_ctx_);
+            surface_generation_.fetch_add(1, std::memory_order_acq_rel);
+            std::unique_ptr<RenderBackend> old_backend;
+            {
+                std::lock_guard<std::mutex> blk(backend_mutex_);
+                old_backend = std::move(backend_);
+            }
+            old_backend->shutdown(api_, render_ctx_);
+            old_backend.reset();
             render_ctx_ = nullptr;
-            backend_ = std::make_unique<SoftwareRenderBackend>();
+
+            auto sw_backend = std::make_unique<SoftwareRenderBackend>();
             std::string sw_err;
-            if (backend_->init(api_, mpv_, &render_ctx_, sw_err)) {
-                surface_generation_.fetch_add(1, std::memory_order_acq_rel);
-                backend_->ensureSurface(target_width_, target_height_, false, sw_err);
+            if (sw_backend->init(api_, mpv_, &render_ctx_, sw_err)) {
+                bool sw_recreated = false;
+                sw_backend->ensureSurface(req_w, req_h, false, sw_recreated, sw_err);
+                {
+                    std::lock_guard<std::mutex> blk(backend_mutex_);
+                    backend_ = std::move(sw_backend);
+                }
                 api_.render_context_set_update_callback(render_ctx_, &MpvPlayer::OnRenderUpdate, this);
                 {
                     std::lock_guard<std::mutex> lock(render_mutex_);
@@ -519,7 +574,8 @@ void MpvPlayer::RenderThreadMain(bool prefer_gpu) {
                     backend_shared_texture_ = false;
                     backend_hdr_supported_ = false;
                 }
-                do_frame = true;
+                do_resize = false;
+                force_redraw = true;
             } else {
                 break;
             }
@@ -527,14 +583,17 @@ void MpvPlayer::RenderThreadMain(bool prefer_gpu) {
 
         if (do_resize && backend_) {
             std::string resize_err;
-            surface_generation_.fetch_add(1, std::memory_order_acq_rel);
-            if (backend_->ensureSurface(req_w, req_h, req_hdr, resize_err)) {
-                do_frame = true;
+            bool recreated = false;
+            if (backend_->ensureSurface(req_w, req_h, req_hdr, recreated, resize_err)) {
+                if (recreated) {
+                    surface_generation_.fetch_add(1, std::memory_order_acq_rel);
+                    force_redraw = true;
+                }
             }
         }
 
         uint64_t update_flags = api_.render_context_update(render_ctx_);
-        bool should_render = ((update_flags & MPV_RENDER_UPDATE_FRAME) != 0) || (do_resize && do_frame);
+        bool should_render = ((update_flags & MPV_RENDER_UPDATE_FRAME) != 0) || force_redraw;
         if (!should_render) continue;
 
         int slot = backend_->acquireFreeSlot();
@@ -566,14 +625,17 @@ void MpvPlayer::RenderThreadMain(bool prefer_gpu) {
             continue;
         }
 
+        auto alive = alive_;
         napi_status status = frame_tsfn_.NonBlockingCall(
             dispatched,
-            [this](Napi::Env env, Napi::Function js_callback, DispatchedFrame* data) {
+            [this, alive](Napi::Env env, Napi::Function js_callback, DispatchedFrame* data) {
                 std::unique_ptr<DispatchedFrame> guard(data);
-                if (destroyed_.load(std::memory_order_acquire) || !js_callback || js_callback.IsEmpty()) {
-                    if (backend_ && guard->generation == surface_generation_.load(std::memory_order_acquire)) {
-                        backend_->releaseSlot(guard->frame.slot_id);
-                    }
+                if (!alive->load(std::memory_order_acquire) || !js_callback || js_callback.IsEmpty()) {
+                    return;
+                }
+                if (guard->generation != surface_generation_.load(std::memory_order_acquire)) {
+                    // Surface pool was resized or switched while this frame was queued; drop cleanly.
+                    // ~DispatchedFrame() closes our duplicated NT handle / releases our retained IOSurface.
                     return;
                 }
 
@@ -638,10 +700,15 @@ void MpvPlayer::RenderThreadMain(bool prefer_gpu) {
     if (render_ctx_) {
         api_.render_context_set_update_callback(render_ctx_, nullptr, nullptr);
     }
-    if (backend_) {
-        backend_->shutdown(api_, render_ctx_);
+    std::unique_ptr<RenderBackend> final_backend;
+    {
+        std::lock_guard<std::mutex> blk(backend_mutex_);
+        final_backend = std::move(backend_);
+    }
+    if (final_backend) {
+        final_backend->shutdown(api_, render_ctx_);
         render_ctx_ = nullptr;
-        backend_.reset();
+        final_backend.reset();
     }
 }
 
@@ -650,6 +717,7 @@ Napi::Value MpvPlayer::Initialize(const Napi::CallbackInfo& info) {
     Napi::Object result = Napi::Object::New(env);
 
     if (initialized_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(render_mutex_);
         result.Set("ok", true);
         result.Set("backend", backend_name_);
         return result;
@@ -686,19 +754,20 @@ Napi::Value MpvPlayer::Initialize(const Napi::CallbackInfo& info) {
         return result;
     }
 
-    if (!mpv_config_path_.empty()) {
-        api_.set_option_string(mpv_, "include", mpv_config_path_.c_str());
-    }
-
-    // Core embedded rendering options (matching stremio-linux-shell baseline + 4K HDR tuning).
-    api_.set_option_string(mpv_, "vo", "libmpv");
+    // Core embedded rendering & streaming resilience defaults (set BEFORE user mpv.conf so users can override).
+    api_.set_option_string(mpv_, "title", "Stremio Enhanced");
+    api_.set_option_string(mpv_, "audio-client-name", "Stremio Enhanced");
     api_.set_option_string(mpv_, "video-timing-offset", "0");
     api_.set_option_string(mpv_, "video-sync", "audio");
     api_.set_option_string(mpv_, "hwdec", "auto-safe");
 #ifdef _WIN32
     api_.set_option_string(mpv_, "d3d11va-zero-copy", "yes");
 #endif
-    api_.set_option_string(mpv_, "vd-lavc-dr", "yes");
+    api_.set_option_string(
+        mpv_,
+        "stream-lavf-o",
+        "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=%23%408,429,500,502,503,504,reconnect_delay_max=15"
+    );
     api_.set_option_string(mpv_, "osc", "no");
     api_.set_option_string(mpv_, "input-default-bindings", "no");
     api_.set_option_string(mpv_, "input-vo-keyboard", "no");
@@ -706,8 +775,19 @@ Napi::Value MpvPlayer::Initialize(const Napi::CallbackInfo& info) {
     api_.set_option_string(mpv_, "idle", "yes");
     api_.set_option_string(mpv_, "tone-mapping", "bt.2390");
     api_.set_option_string(mpv_, "hdr-compute-peak", "yes");
+    api_.set_option_string(mpv_, "dither-depth", "auto");
+    api_.set_option_string(mpv_, "deband", "yes");
+    api_.set_option_string(mpv_, "scale", "spline36");
+    api_.set_option_string(mpv_, "cscale", "spline36");
     api_.set_option_string(mpv_, "demuxer-max-bytes", "150MiB");
     api_.set_option_string(mpv_, "demuxer-max-back-bytes", "75MiB");
+
+    if (!mpv_config_path_.empty()) {
+        api_.set_option_string(mpv_, "include", mpv_config_path_.c_str());
+    }
+
+    // Always force vo=libmpv after user config so embedded rendering cannot be broken by mpv.conf.
+    api_.set_option_string(mpv_, "vo", "libmpv");
 
     int err = api_.initialize(mpv_);
     if (err < 0) {
@@ -762,12 +842,12 @@ Napi::Value MpvPlayer::Resize(const Napi::CallbackInfo& info) {
 
     int w = std::max(16, info[0].As<Napi::Number>().Int32Value());
     int h = std::max(16, info[1].As<Napi::Number>().Int32Value());
-    bool hdr = (info.Length() >= 3 && info[2].IsBoolean())
-        ? info[2].As<Napi::Boolean>().Value()
-        : target_hdr_;
+    bool has_hdr = (info.Length() >= 3 && info[2].IsBoolean());
+    bool req_hdr = has_hdr ? info[2].As<Napi::Boolean>().Value() : false;
 
     {
         std::lock_guard<std::mutex> lock(render_mutex_);
+        bool hdr = has_hdr ? req_hdr : target_hdr_;
         if (w == target_width_ && h == target_height_ && hdr == target_hdr_) {
             return env.Undefined();
         }
@@ -782,14 +862,15 @@ Napi::Value MpvPlayer::Resize(const Napi::CallbackInfo& info) {
 
 Napi::Value MpvPlayer::ReleaseFrame(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (!backend_ || info.Length() < 1) return env.Undefined();
+    if (info.Length() < 1) return env.Undefined();
 
     int slot = info[0].As<Napi::Number>().Int32Value();
     uint64_t gen = (info.Length() >= 2 && info[1].IsNumber())
         ? static_cast<uint64_t>(info[1].As<Napi::Number>().Int64Value())
         : surface_generation_.load(std::memory_order_acquire);
 
-    if (gen == surface_generation_.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> blk(backend_mutex_);
+    if (backend_ && gen == surface_generation_.load(std::memory_order_acquire)) {
         backend_->releaseSlot(slot);
     }
     return env.Undefined();
@@ -842,7 +923,15 @@ Napi::Value MpvPlayer::SetProperty(const Napi::CallbackInfo& info) {
         }
     } else if (val.IsNumber()) {
         double num = val.As<Napi::Number>().DoubleValue();
-        res = api_.set_property(mpv_, name.c_str(), MPV_FORMAT_DOUBLE, &num);
+        if (std::isfinite(num) && std::trunc(num) == num && std::abs(num) <= 9007199254740991.0) {
+            int64_t i64 = static_cast<int64_t>(num);
+            res = api_.set_property(mpv_, name.c_str(), MPV_FORMAT_INT64, &i64);
+            if (res < 0) {
+                res = api_.set_property(mpv_, name.c_str(), MPV_FORMAT_DOUBLE, &num);
+            }
+        } else {
+            res = api_.set_property(mpv_, name.c_str(), MPV_FORMAT_DOUBLE, &num);
+        }
         if (res < 0) {
             std::string str = val.ToString().Utf8Value();
             res = api_.set_property_string(mpv_, name.c_str(), str.c_str());

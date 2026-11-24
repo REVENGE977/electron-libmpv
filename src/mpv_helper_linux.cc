@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <atomic>
 #include <clocale>
+#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -315,19 +318,25 @@ private:
 
         if (init_ok && backend_ && render_ctx_) {
             std::string surf_err;
-            if (!backend_->ensureSurface(target_width_, target_height_, target_hdr_, surf_err)) {
+            bool recreated = false;
+            if (!backend_->ensureSurface(target_width_, target_height_, target_hdr_, recreated, surf_err)) {
                 if (backend_->supportsSharedTexture()) {
                     gpu_error = gpu_error.empty() ? surf_err : (gpu_error + " | " + surf_err);
                     backend_->shutdown(api_, render_ctx_);
                     render_ctx_ = nullptr;
                     gpu_ptr = nullptr;
-                    backend_ = std::make_unique<SoftwareRenderBackend>();
+                    {
+                        std::lock_guard<std::mutex> blk(backend_mutex_);
+                        backend_ = std::make_unique<SoftwareRenderBackend>();
+                    }
                     std::string sw_err;
+                    bool sw_recreated = false;
                     if (backend_->init(api_, mpv_, &render_ctx_, sw_err)) {
-                        backend_->ensureSurface(target_width_, target_height_, false, sw_err);
+                        backend_->ensureSurface(target_width_, target_height_, false, sw_recreated, sw_err);
                     } else {
                         init_ok = false;
                         init_error = surf_err + " | SW fallback: " + sw_err;
+                        std::lock_guard<std::mutex> blk(backend_mutex_);
                         backend_.reset();
                     }
                 } else {
@@ -364,9 +373,9 @@ private:
         }
 
         while (true) {
-            bool do_frame = false;
             bool do_resize = false;
             bool do_fallback = false;
+            bool force_redraw = false;
             int req_w = 0;
             int req_h = 0;
             bool req_hdr = false;
@@ -379,6 +388,10 @@ private:
 
                 if (render_stop_) break;
 
+                req_w = target_width_;
+                req_h = target_height_;
+                req_hdr = target_hdr_;
+
                 if (render_fallback_requested_) {
                     do_fallback = true;
                     render_fallback_requested_ = false;
@@ -386,26 +399,34 @@ private:
                 if (render_resize_pending_) {
                     do_resize = true;
                     render_resize_pending_ = false;
-                    req_w = target_width_;
-                    req_h = target_height_;
-                    req_hdr = target_hdr_;
                 }
                 if (render_frame_pending_) {
-                    do_frame = true;
                     render_frame_pending_ = false;
                 }
             }
 
             if (do_fallback && backend_->supportsSharedTexture()) {
                 api_.render_context_set_update_callback(render_ctx_, nullptr, nullptr);
-                backend_->shutdown(api_, render_ctx_);
-                render_ctx_ = nullptr;
+                surface_generation_.fetch_add(1, std::memory_order_acq_rel);
                 gpu_ptr = nullptr;
-                backend_ = std::make_unique<SoftwareRenderBackend>();
+                std::unique_ptr<RenderBackend> old_backend;
+                {
+                    std::lock_guard<std::mutex> blk(backend_mutex_);
+                    old_backend = std::move(backend_);
+                }
+                old_backend->shutdown(api_, render_ctx_);
+                old_backend.reset();
+                render_ctx_ = nullptr;
+
+                auto sw_backend = std::make_unique<SoftwareRenderBackend>();
                 std::string sw_err;
-                if (backend_->init(api_, mpv_, &render_ctx_, sw_err)) {
-                    surface_generation_.fetch_add(1, std::memory_order_acq_rel);
-                    backend_->ensureSurface(target_width_, target_height_, false, sw_err);
+                if (sw_backend->init(api_, mpv_, &render_ctx_, sw_err)) {
+                    bool sw_recreated = false;
+                    sw_backend->ensureSurface(req_w, req_h, false, sw_recreated, sw_err);
+                    {
+                        std::lock_guard<std::mutex> blk(backend_mutex_);
+                        backend_ = std::move(sw_backend);
+                    }
                     api_.render_context_set_update_callback(render_ctx_, &HelperApp::OnRenderUpdate, this);
                     {
                         std::lock_guard<std::mutex> lock(render_mutex_);
@@ -418,7 +439,8 @@ private:
                     bw.u8(0);
                     bw.u8(0);
                     sendMsg(EVT_BACKEND_UPDATE, bw);
-                    do_frame = true;
+                    do_resize = false;
+                    force_redraw = true;
                 } else {
                     break;
                 }
@@ -426,17 +448,20 @@ private:
 
             if (do_resize && backend_) {
                 std::string resize_err;
-                uint64_t new_gen = surface_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
-                if (backend_->ensureSurface(req_w, req_h, req_hdr, resize_err)) {
-                    if (gpu_ptr) {
-                        publishSurfacePool(gpu_ptr, new_gen);
+                bool recreated = false;
+                if (backend_->ensureSurface(req_w, req_h, req_hdr, recreated, resize_err)) {
+                    if (recreated) {
+                        uint64_t new_gen = surface_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+                        if (gpu_ptr) {
+                            publishSurfacePool(gpu_ptr, new_gen);
+                        }
+                        force_redraw = true;
                     }
-                    do_frame = true;
                 }
             }
 
             uint64_t update_flags = api_.render_context_update(render_ctx_);
-            bool should_render = ((update_flags & MPV_RENDER_UPDATE_FRAME) != 0) || (do_resize && do_frame);
+            bool should_render = ((update_flags & MPV_RENDER_UPDATE_FRAME) != 0) || force_redraw;
             if (!should_render) continue;
 
             int slot = backend_->acquireFreeSlot();
@@ -489,10 +514,15 @@ private:
         if (render_ctx_) {
             api_.render_context_set_update_callback(render_ctx_, nullptr, nullptr);
         }
-        if (backend_) {
-            backend_->shutdown(api_, render_ctx_);
+        std::unique_ptr<RenderBackend> final_backend;
+        {
+            std::lock_guard<std::mutex> blk(backend_mutex_);
+            final_backend = std::move(backend_);
+        }
+        if (final_backend) {
+            final_backend->shutdown(api_, render_ctx_);
             render_ctx_ = nullptr;
-            backend_.reset();
+            final_backend.reset();
         }
     }
 
@@ -537,14 +567,16 @@ private:
                     return true;
                 }
 
-                if (!config_path.empty()) {
-                    api_.set_option_string(mpv_, "include", config_path.c_str());
-                }
-
-                api_.set_option_string(mpv_, "vo", "libmpv");
+                api_.set_option_string(mpv_, "title", "Stremio Enhanced");
+                api_.set_option_string(mpv_, "audio-client-name", "Stremio Enhanced");
                 api_.set_option_string(mpv_, "video-timing-offset", "0");
                 api_.set_option_string(mpv_, "video-sync", "audio");
-                api_.set_option_string(mpv_, "hwdec", "auto-copy");
+                api_.set_option_string(mpv_, "hwdec", "vaapi,vaapi-copy,auto-copy");
+                api_.set_option_string(
+                    mpv_,
+                    "stream-lavf-o",
+                    "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=%23%408,429,500,502,503,504,reconnect_delay_max=15"
+                );
                 api_.set_option_string(mpv_, "osc", "no");
                 api_.set_option_string(mpv_, "input-default-bindings", "no");
                 api_.set_option_string(mpv_, "input-vo-keyboard", "no");
@@ -552,8 +584,18 @@ private:
                 api_.set_option_string(mpv_, "idle", "yes");
                 api_.set_option_string(mpv_, "tone-mapping", "bt.2390");
                 api_.set_option_string(mpv_, "hdr-compute-peak", "yes");
+                api_.set_option_string(mpv_, "dither-depth", "auto");
+                api_.set_option_string(mpv_, "deband", "yes");
+                api_.set_option_string(mpv_, "scale", "spline36");
+                api_.set_option_string(mpv_, "cscale", "spline36");
                 api_.set_option_string(mpv_, "demuxer-max-bytes", "150MiB");
                 api_.set_option_string(mpv_, "demuxer-max-back-bytes", "75MiB");
+
+                if (!config_path.empty()) {
+                    api_.set_option_string(mpv_, "include", config_path.c_str());
+                }
+
+                api_.set_option_string(mpv_, "vo", "libmpv");
 
                 int err = api_.initialize(mpv_);
                 if (err < 0) {
@@ -595,9 +637,9 @@ private:
                 if (!r.i32(w) || !r.i32(h) || !r.u8(has_hdr) || !r.u8(hdr)) return true;
                 w = std::max(16, static_cast<int>(w));
                 h = std::max(16, static_cast<int>(h));
-                bool req_hdr = has_hdr ? (hdr != 0) : target_hdr_;
                 {
                     std::lock_guard<std::mutex> lock(render_mutex_);
+                    bool req_hdr = has_hdr ? (hdr != 0) : target_hdr_;
                     if (w == target_width_ && h == target_height_ && req_hdr == target_hdr_) {
                         return true;
                     }
@@ -614,7 +656,9 @@ private:
                 int32_t slot = -1;
                 uint64_t gen = 0;
                 if (!r.i32(slot) || !r.u64(gen)) return true;
-                if (backend_ && gen == surface_generation_.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> blk(backend_mutex_);
+                if (backend_ && (gen == std::numeric_limits<uint64_t>::max() ||
+                                 gen == surface_generation_.load(std::memory_order_acquire))) {
                     backend_->releaseSlot(slot);
                 }
                 return true;
@@ -658,8 +702,26 @@ private:
                 } else if (vt == VAL_DOUBLE) {
                     double d = 0.0;
                     if (!r.f64(d)) return true;
-                    if (api_.set_property(mpv_, name.c_str(), MPV_FORMAT_DOUBLE, &d) < 0) {
-                        std::string s = std::to_string(d);
+                    int res = -1;
+                    bool is_int = std::isfinite(d) && std::trunc(d) == d && std::abs(d) <= 9007199254740991.0;
+                    if (is_int) {
+                        int64_t i64 = static_cast<int64_t>(d);
+                        res = api_.set_property(mpv_, name.c_str(), MPV_FORMAT_INT64, &i64);
+                        if (res < 0) {
+                            res = api_.set_property(mpv_, name.c_str(), MPV_FORMAT_DOUBLE, &d);
+                        }
+                    } else {
+                        res = api_.set_property(mpv_, name.c_str(), MPV_FORMAT_DOUBLE, &d);
+                    }
+                    if (res < 0) {
+                        std::string s;
+                        if (is_int) {
+                            s = std::to_string(static_cast<int64_t>(d));
+                        } else {
+                            char buf[64];
+                            std::snprintf(buf, sizeof(buf), "%.15g", d);
+                            s = buf;
+                        }
                         api_.set_property_string(mpv_, name.c_str(), s.c_str());
                     }
                 } else if (vt == VAL_STRING) {
@@ -765,6 +827,7 @@ private:
     mpv_handle* mpv_ = nullptr;
     mpv_render_context* render_ctx_ = nullptr;
     std::unique_ptr<RenderBackend> backend_;
+    std::mutex backend_mutex_;
 
     std::thread event_thread_;
     std::thread render_thread_;

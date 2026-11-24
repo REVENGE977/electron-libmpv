@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <signal.h>
@@ -199,12 +200,6 @@ private:
             return false;
         }
 
-        // Clear FD_CLOEXEC on child end so it survives execv.
-        int flags = fcntl(sv[1], F_GETFD);
-        if (flags >= 0) {
-            fcntl(sv[1], F_SETFD, flags & ~FD_CLOEXEC);
-        }
-
         std::string fd_arg = std::to_string(sv[1]);
         pid_t pid = fork();
         if (pid < 0) {
@@ -215,8 +210,13 @@ private:
         }
 
         if (pid == 0) {
-            // Child process: close parent end and exec the clean native helper binary.
+            // Child process: close parent end, clear FD_CLOEXEC only in child so concurrent
+            // parent forks cannot inherit sv[1], and exec the clean native helper binary.
             close(sv[0]);
+            int flags = fcntl(sv[1], F_GETFD);
+            if (flags >= 0) {
+                fcntl(sv[1], F_SETFD, flags & ~FD_CLOEXEC);
+            }
             char* argv[] = {
                 const_cast<char*>(helper_path.c_str()),
                 const_cast<char*>(fd_arg.c_str()),
@@ -279,10 +279,16 @@ private:
                     std::string bname;
                     uint8_t st = 0, hdr = 0;
                     if (r.str(bname) && r.u8(st) && r.u8(hdr)) {
-                        std::lock_guard<std::mutex> lock(state_mutex_);
-                        backend_name_ = bname;
-                        backend_shared_texture_ = (st != 0);
-                        backend_hdr_supported_ = (hdr != 0);
+                        {
+                            std::lock_guard<std::mutex> lock(state_mutex_);
+                            backend_name_ = bname;
+                            backend_shared_texture_ = (st != 0);
+                            backend_hdr_supported_ = (hdr != 0);
+                        }
+                        if (st == 0) {
+                            std::lock_guard<std::mutex> lock(pool_mutex_);
+                            active_pool_.reset();
+                        }
                     }
                     break;
                 }
@@ -353,15 +359,18 @@ private:
                         int64_t ts;
                     };
                     auto* d = new GpuDispatch{ std::move(pool), slot_id, gen, ts };
+                    auto alive = alive_;
                     napi_status st = frame_tsfn_.NonBlockingCall(
                         d,
-                        [this](Napi::Env env, Napi::Function js_cb, GpuDispatch* data) {
+                        [this, alive](Napi::Env env, Napi::Function js_cb, GpuDispatch* data) {
                             std::unique_ptr<GpuDispatch> guard(data);
-                            if (destroyed_.load(std::memory_order_acquire) || !js_cb || js_cb.IsEmpty()) {
-                                linux_ipc::Writer rw;
-                                rw.i32(guard->slot_id);
-                                rw.u64(guard->gen);
-                                sendCmd(linux_ipc::CMD_RELEASE_FRAME, rw);
+                            if (!alive->load(std::memory_order_acquire) || !js_cb || js_cb.IsEmpty()) {
+                                if (alive->load(std::memory_order_acquire)) {
+                                    linux_ipc::Writer rw;
+                                    rw.i32(guard->slot_id);
+                                    rw.u64(guard->gen);
+                                    sendCmd(linux_ipc::CMD_RELEASE_FRAME, rw);
+                                }
                                 return;
                             }
                             const auto& s = guard->pool->slots[guard->slot_id];
@@ -434,15 +443,18 @@ private:
                         std::vector<uint8_t> pixels;
                     };
                     auto* d = new SwDispatch{ slot_id, gen, w, h, stride, ts, std::vector<uint8_t>(px, px + px_len) };
+                    auto alive = alive_;
                     napi_status st = frame_tsfn_.NonBlockingCall(
                         d,
-                        [this](Napi::Env env, Napi::Function js_cb, SwDispatch* data) {
+                        [this, alive](Napi::Env env, Napi::Function js_cb, SwDispatch* data) {
                             std::unique_ptr<SwDispatch> guard(data);
-                            if (destroyed_.load(std::memory_order_acquire) || !js_cb || js_cb.IsEmpty()) {
-                                linux_ipc::Writer rw;
-                                rw.i32(guard->slot_id);
-                                rw.u64(guard->gen);
-                                sendCmd(linux_ipc::CMD_RELEASE_FRAME, rw);
+                            if (!alive->load(std::memory_order_acquire) || !js_cb || js_cb.IsEmpty()) {
+                                if (alive->load(std::memory_order_acquire)) {
+                                    linux_ipc::Writer rw;
+                                    rw.i32(guard->slot_id);
+                                    rw.u64(guard->gen);
+                                    sendCmd(linux_ipc::CMD_RELEASE_FRAME, rw);
+                                }
                                 return;
                             }
                             Napi::Object obj = Napi::Object::New(env);
@@ -472,11 +484,12 @@ private:
                 case linux_ipc::EVT_MPV_EVENT: {
                     if (!has_event_tsfn_ || destroyed_.load(std::memory_order_acquire)) break;
                     auto* raw = new std::vector<uint8_t>(std::move(payload));
+                    auto alive = alive_;
                     napi_status st = event_tsfn_.NonBlockingCall(
                         raw,
-                        [this](Napi::Env env, Napi::Function js_cb, std::vector<uint8_t>* buf) {
+                        [alive](Napi::Env env, Napi::Function js_cb, std::vector<uint8_t>* buf) {
                             std::unique_ptr<std::vector<uint8_t>> guard(buf);
-                            if (destroyed_.load(std::memory_order_acquire) || !js_cb || js_cb.IsEmpty()) return;
+                            if (!alive->load(std::memory_order_acquire) || !js_cb || js_cb.IsEmpty()) return;
 
                             linux_ipc::Reader er(guard->data(), guard->size());
                             uint8_t kind = 0;
@@ -574,12 +587,7 @@ private:
         prop_cv_.notify_all();
     }
 
-    void ShutdownInternal() {
-        bool expected = false;
-        if (!destroyed_.compare_exchange_strong(expected, true)) {
-            return;
-        }
-
+    void stopHelperProcess() {
         if (sock_fd_ >= 0) {
             linux_ipc::Writer w;
             {
@@ -611,6 +619,17 @@ private:
             }
             if (!reaped) {
                 kill(child_pid_, SIGTERM);
+                for (int i = 0; i < 50; ++i) {
+                    pid_t r = waitpid(child_pid_, &status, WNOHANG);
+                    if (r == child_pid_ || r < 0) {
+                        reaped = true;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
+            if (!reaped) {
+                kill(child_pid_, SIGKILL);
                 waitpid(child_pid_, &status, 0);
             }
             child_pid_ = -1;
@@ -620,6 +639,16 @@ private:
             std::lock_guard<std::mutex> lock(pool_mutex_);
             active_pool_.reset();
         }
+    }
+
+    void ShutdownInternal() {
+        bool expected = false;
+        if (!destroyed_.compare_exchange_strong(expected, true)) {
+            return;
+        }
+        alive_->store(false, std::memory_order_release);
+
+        stopHelperProcess();
 
         if (has_event_tsfn_) {
             event_tsfn_.Release();
@@ -659,6 +688,13 @@ private:
             }
         }
 
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            init_done_ = false;
+            init_ok_ = false;
+            init_error_.clear();
+        }
+
         std::string spawn_err;
         if (!spawnHelper(spawn_err)) {
             result.Set("ok", false);
@@ -675,23 +711,29 @@ private:
         w.str(mpv_config_path_);
         sendCmd(linux_ipc::CMD_INIT, w);
 
+        bool ok = false;
+        std::string err_copy;
         {
             std::unique_lock<std::mutex> lock(state_mutex_);
             init_cv_.wait(lock, [this]() { return init_done_; });
-            if (!init_ok_) {
-                result.Set("ok", false);
-                result.Set("error", init_error_);
-                return result;
+            ok = init_ok_;
+            err_copy = init_error_;
+            if (ok) {
+                initialized_.store(true, std::memory_order_release);
+                result.Set("ok", true);
+                result.Set("backend", backend_name_);
+                result.Set("sharedTexture", backend_shared_texture_);
+                result.Set("hdrSupported", backend_hdr_supported_);
+                result.Set("libmpvPath", libmpv_path_);
+                if (!gpu_error_.empty()) {
+                    result.Set("gpuError", gpu_error_);
+                }
             }
-            initialized_.store(true, std::memory_order_release);
-            result.Set("ok", true);
-            result.Set("backend", backend_name_);
-            result.Set("sharedTexture", backend_shared_texture_);
-            result.Set("hdrSupported", backend_hdr_supported_);
-            result.Set("libmpvPath", libmpv_path_);
-            if (!gpu_error_.empty()) {
-                result.Set("gpuError", gpu_error_);
-            }
+        }
+        if (!ok) {
+            stopHelperProcess();
+            result.Set("ok", false);
+            result.Set("error", err_copy);
         }
         return result;
     }
@@ -723,7 +765,7 @@ private:
         int32_t slot = info[0].As<Napi::Number>().Int32Value();
         uint64_t gen = (info.Length() >= 2 && info[1].IsNumber())
             ? static_cast<uint64_t>(info[1].As<Napi::Number>().Int64Value())
-            : 0;
+            : std::numeric_limits<uint64_t>::max();
         linux_ipc::Writer wr;
         wr.i32(slot);
         wr.u64(gen);
@@ -866,6 +908,7 @@ private:
     bool has_event_tsfn_ = false;
     bool has_frame_tsfn_ = false;
 
+    std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
     std::atomic<bool> destroyed_{false};
     std::atomic<bool> initialized_{false};
 
